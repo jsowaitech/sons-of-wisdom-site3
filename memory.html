@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <title>AI Memory – Son of Wisdom</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+</head>
+<body>
+  <header>
+    <button onclick="window.location.href='index.html'">← Back</button>
+    <span id="user-email" class="user-email"></span>
+    <button id="theme-toggle">🌓</button>
+  </header>
+  <main>
+    <h2>My Memory</h2>
+    <input id="search-mem" placeholder="Search memory...">
+    <div id="mem-list"></div>
+  </main>
+  <script>
+    // Demo: Fake memory list, replace with real fetch from Supabase/Pinecone backend
+    const memList = [
+      {id: 1, text: "You prefer morning coaching.", timestamp: "2025-07-17"},
+      {id: 2, text: "AI noticed you felt motivated last session.", timestamp: "2025-07-15"}
+    ];
+    function renderList(filter="") {
+      const el = document.getElementById("mem-list");
+      el.innerHTML = "";
+      memList.filter(m => !filter || m.text.includes(filter)).forEach(m => {
+        let div = document.createElement("div");
+        div.className = "memory-item";
+        div.innerHTML = `
+          <b>${m.timestamp}:</b> ${m.text}
+          <button onclick="deleteMem(${m.id})">🗑️</button>
+          <button onclick="editMem(${m.id})">✏️</button>
+        `;
+        el.appendChild(div);
+      });
+    }
+    window.deleteMem = id => { alert("Delete " + id + " (replace with DB delete)"); };
+    window.editMem = id => { alert("Edit " + id + " (replace with DB update)"); };
+    document.getElementById("search-mem").oninput = e => renderList(e.target.value);
+    renderList();
+
+    // Auth, theme
+    const supabase = supabase.createClient("https://YOUR-PROJECT.supabase.co", "YOUR-ANON-KEY");
+    async function loadUser() {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) window.location.href = "auth.html";
+      document.getElementById("user-email").textContent = user.email || "(no email)";
+    }
+    loadUser();
+    document.getElementById("theme-toggle").onclick = function() {
+      const html = document.documentElement;
+      html.dataset.theme = html.dataset.theme === "dark" ? "light" : "dark";
+      localStorage.setItem("sow-theme", html.dataset.theme);
+    };
+    (function(){const t = localStorage.getItem("sow-theme");if(t) document.documentElement.dataset.theme = t;})();
+  </script>
+</body>
+</html>

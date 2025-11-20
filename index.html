@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Son of Wisdom</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0e1216" />
+  <link rel="icon" href="Sonofwisdom.png" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <p class="powered-by">powered by Son of Wisdom</p>
+
+    <!-- Avatar + animated ring + status -->
+    <div id="avatar-container" aria-live="polite" aria-atomic="false">
+      <canvas id="voiceRing" width="220" height="220"></canvas>
+      <img id="avatar" src="Sonofwisdom.png" alt="Son of Wisdom" />
+      <div id="status-text" role="status">Tap the blue call button to begin.</div>
+    </div>
+
+    <!-- Call transcript block (live interim + final lines) -->
+    <div id="transcript" aria-live="polite" aria-atomic="false">
+      <div id="transcript-interim"></div>
+      <div id="transcript-list"></div>
+    </div>
+
+    <!-- Chat panel is created dynamically by main.js (ensureChatUI). -->
+    <!-- It will appear just below the transcript when chat mode is toggled. -->
+
+    <!-- Controls -->
+    <div id="controls" role="toolbar" aria-label="Call controls">
+      <button id="mic-btn" aria-pressed="false" aria-label="Toggle microphone"></button>
+      <button id="call-btn" aria-label="Start or end call"></button>
+      <button id="speaker-btn" aria-pressed="true" aria-label="Toggle speaker"></button>
+      <!-- Optional chat/call view toggle button (hidden by default).
+           main.js also supports the keyboard shortcut "C". -->
+      <button id="mode-btn" aria-pressed="false" aria-label="Toggle chat view" style="display:none"></button>
+    </div>
+  </div>
+
+  <!-- Supabase UMD -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.43.4/dist/umd/supabase.min.js"></script>
+  <!-- Hume realtime helper (safe if disabled in main.js) -->
+  <script src="hume.js"></script>
+  <!-- App logic -->
+  <script src="main.js"></script>
+</body>
+</html>

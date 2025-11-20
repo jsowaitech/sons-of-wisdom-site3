@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Login / Signup – Son of Wisdom</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    :root{
+      /* Fluid sizing */
+      --card-w: clamp(320px, 88vw, 520px);
+      --card-pad: clamp(18px, 3vw, 28px);
+      --radius-lg: 22px;
+
+      --logo: clamp(56px, 10vw, 84px);
+      --title: clamp(18px, 2.2vw, 24px);
+      --text: clamp(14px, 1.2vw, 16px);
+      --btn: clamp(13px, 1.2vw, 15px);
+      --inset-y: clamp(10px, 1.6vw, 14px);
+
+      --bg1: #181f2b;
+      --bg2: #101217;
+      --panel: #1e2533dd;
+      --panel-border: #2b3447;
+      --ink: #e8eefc;
+      --muted: #b8bfcf;
+      --brand: #2596ff;
+      --brand-2: #1a6fcc;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body{
+      margin: 0;
+      color: var(--ink);
+      background: radial-gradient(ellipse at center, var(--bg1) 60%, var(--bg2));
+      font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      display: grid;
+      place-items: center;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    }
+
+    .card{
+      width: var(--card-w);
+      padding: calc(var(--card-pad) + var(--logo)/2 * 0.15) var(--card-pad) var(--card-pad);
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: var(--radius-lg);
+      box-shadow: 0 10px 40px rgba(0,0,0,.35);
+      position: relative;
+    }
+
+    .logo{
+      width: var(--logo);
+      height: var(--logo);
+      border-radius: 50%;
+      object-fit: cover;
+      background:#222;
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      top: calc(-1 * var(--logo) * 0.45);
+      box-shadow: 0 4px 18px rgba(0,0,0,.4);
+    }
+
+    h1{
+      font-size: var(--title);
+      text-align: center;
+      margin: calc(var(--logo) * 0.35) 0 var(--inset-y);
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    form{
+      display: grid;
+      gap: 12px;
+      font-size: var(--text);
+    }
+
+    input{
+      width: 100%;
+      background: #222534;
+      color: var(--ink);
+      border: 1.5px solid #293143;
+      border-radius: 14px;
+      padding: 12px 16px;
+      outline: none;
+      transition: border .18s, box-shadow .18s;
+      font-size: var(--text);
+    }
+    input:focus{
+      border-color: var(--brand);
+      box-shadow: 0 0 0 4px #2596ff33;
+    }
+
+    .row{
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      margin-top: 4px;
+      flex-wrap: wrap;
+    }
+
+    button{
+      appearance: none;
+      border: 0;
+      border-radius: 14px;
+      padding: 10px 18px;
+      background: var(--brand);
+      color: white;
+      font-weight: 600;
+      font-size: var(--btn);
+      cursor: pointer;
+      box-shadow: 0 4px 18px rgba(0,0,0,.3);
+      transition: transform .12s ease, background .16s ease, box-shadow .16s ease;
+    }
+    button:hover{ background: var(--brand-2); }
+    button:active{ transform: translateY(1px); }
+
+    .btn-ghost{
+      background: transparent;
+      border: 1px solid #32405a;
+      color: var(--ink);
+    }
+    .btn-ghost:hover{ background:#2a3448; }
+
+    .link{
+      display: inline-block;
+      margin: 8px auto 0;
+      color: #a8d2ff;
+      text-decoration: none;
+      font-size: var(--btn);
+    }
+    .link:hover{ text-decoration: underline; }
+
+    .note{
+      margin-top: 14px;
+      text-align: center;
+      color: #96a2bb;
+      font-size: calc(var(--text) - 2px);
+    }
+
+    /* inline status */
+    #status {
+      text-align: center;
+      color: #a8d2ff;
+      min-height: 1.2em;
+      font-size: calc(var(--text) - 1px);
+    }
+
+    /* Comfort on very large screens */
+    @media (min-width: 1200px){
+      .card{ border-radius: 26px; }
+    }
+  </style>
+
+  <!-- Supabase UMD -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.43.4/dist/umd/supabase.min.js"></script>
+</head>
+<body>
+  <div class="card">
+    <img class="logo" src="Sonofwisdom.png" alt="Son of Wisdom" />
+    <h1>Sign in to Son of Wisdom</h1>
+
+    <form id="auth-form" onsubmit="return false;">
+      <input type="email" id="email" placeholder="Email" autocomplete="username" required />
+      <input type="password" id="password" placeholder="Password" autocomplete="current-password" required />
+
+      <div class="row">
+        <button type="button" id="login-btn">Log In</button>
+        <button type="button" id="signup-btn">Sign Up</button>
+      </div>
+
+      <a class="link" href="#" id="forgot-link">Forgot password?</a>
+
+      <div class="row" style="margin-top: 12px;">
+        <button type="button" class="btn-ghost" id="continue-btn">Continue to App</button>
+        <button type="button" class="btn-ghost" id="logout-btn">Log out</button>
+      </div>
+
+      <div id="status" role="status" aria-live="polite"></div>
+
+      <div class="note">
+        Note: This page uses a Service Role key for testing. Do not deploy publicly.
+      </div>
+    </form>
+  </div>
+
+  <script>
+    // ⚠️ Service role key is intentionally here for local/dev testing per your request
+    const SUPABASE_URL = 'https://plrobtlpedniyvkpwdmp.supabase.co';
+    const SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBscm9idGxwZWRuaXl2a3B3ZG1wIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0NjYyOTg1MCwiZXhwIjoyMDYyMjA1ODUwfQ.IhY398suDk3RKXAAgyO5FM6Wr8SbkDyd8bE8pql6nSE';
+
+    const supabase = window.supabase.createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+    });
+
+    const USER_ID_KEY = 'sow_user_id';
+    const emailEl = document.getElementById('email');
+    const passwordEl = document.getElementById('password');
+    const statusEl = document.getElementById('status');
+
+    function setLoading(isLoading){
+      for (const id of ['login-btn','signup-btn','logout-btn','continue-btn']) {
+        const b = document.getElementById(id);
+        if (b) b.disabled = !!isLoading;
+      }
+    }
+    function toast(msg){ statusEl.textContent = msg || ''; }
+
+    async function saveUserIdFromSession(){
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user?.id) localStorage.setItem(USER_ID_KEY, user.id);
+    }
+
+    // Handle password recovery flow (hash contains access_token)
+    async function handleHashRecoveryIfPresent(){
+      const hash = new URLSearchParams(location.hash.slice(1));
+      const access_token = hash.get('access_token');
+      if (!access_token) return;
+
+      try {
+        setLoading(true);
+        const refresh_token = hash.get('refresh_token');
+        if (refresh_token) {
+          await supabase.auth.setSession({ access_token, refresh_token });
+        }
+        // Prompt for new password
+        let newPass = '';
+        while (!newPass) {
+          newPass = prompt('Enter a new password:') || '';
+          if (!newPass) {
+            if (!confirm('No password entered. Cancel password reset?')) continue;
+            break;
+          }
+        }
+        if (newPass) {
+          const { error } = await supabase.auth.updateUser({ password: newPass });
+          if (error) throw error;
+          await saveUserIdFromSession();
+          toast('Password updated. You are now signed in.');
+        }
+        // Clean URL hash
+        history.replaceState({}, document.title, location.pathname);
+      } catch (e) {
+        toast(e.message || 'Password update failed.');
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    document.getElementById('login-btn').onclick = async () => {
+      const email = emailEl.value.trim();
+      const password = passwordEl.value;
+      if (!email || !password) return toast('Enter email and password.');
+      try {
+        setLoading(true);
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        await saveUserIdFromSession();
+        toast('Logged in.');
+      } catch (e) {
+        toast(e.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    document.getElementById('signup-btn').onclick = async () => {
+      const email = emailEl.value.trim();
+      const password = passwordEl.value;
+      if (!email || !password) return toast('Enter email and password.');
+      try {
+        setLoading(true);
+        const { error } = await supabase.auth.signUp({ email, password });
+        if (error) throw error;
+        toast('Signup request sent. Check your email to confirm.');
+      } catch (e) {
+        toast(e.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    document.getElementById('logout-btn').onclick = async () => {
+      try {
+        setLoading(true);
+        await supabase.auth.signOut();
+        localStorage.removeItem(USER_ID_KEY);
+        toast('Logged out.');
+      } catch (e) {
+        toast(e.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    document.getElementById('continue-btn').onclick = () => {
+      saveUserIdFromSession().finally(() => {
+        window.location.href = 'index.html';
+      });
+    };
+
+    document.getElementById('forgot-link').onclick = async (e) => {
+      e.preventDefault();
+      const email = emailEl.value.trim();
+      if (!email) return toast('Enter your email first.');
+      try {
+        setLoading(true);
+        const { error } = await supabase.auth.resetPasswordForEmail(email, {
+          redirectTo: window.location.origin + '/auth.html'
+        });
+        if (error) throw error;
+        toast('Password reset email sent.');
+      } catch (err) {
+        toast(err.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    // Run on load
+    handleHashRecoveryIfPresent();
+    saveUserIdFromSession();
+  </script>
+</body>
+</html>

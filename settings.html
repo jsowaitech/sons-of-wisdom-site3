@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <title>Settings – Son of Wisdom</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+</head>
+<body>
+  <header>
+    <button onclick="window.location.href='index.html'">← Back</button>
+    <span id="user-email" class="user-email"></span>
+    <button id="theme-toggle">🌓</button>
+  </header>
+  <main>
+    <h2>Edit Settings</h2>
+    <form id="settings-form">
+      <label>
+        Display Name:
+        <input type="text" id="display-name" placeholder="Your Name">
+      </label><br>
+      <label>
+        Email Notifications:
+        <input type="checkbox" id="email-notifs">
+      </label><br>
+      <button type="submit">Save Changes</button>
+    </form>
+  </main>
+  <script>
+    // --- Load User & Settings ---
+    const supabase = supabase.createClient("https://YOUR-PROJECT.supabase.co", "YOUR-ANON-KEY");
+    let userObj = null;
+    async function loadSettings() {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) window.location.href = "auth.html";
+      userObj = user;
+      document.getElementById("user-email").textContent = user.email;
+      // Optionally, load settings from Supabase DB table if you store them
+    }
+    loadSettings();
+
+    // Save settings (to DB or localStorage for demo)
+    document.getElementById("settings-form").onsubmit = async function(e) {
+      e.preventDefault();
+      // Save logic here (Supabase upsert for prod)
+      alert("Settings saved! (Demo, connect to DB for real save)");
+    };
+
+    // Theme toggle
+    document.getElementById("theme-toggle").onclick = function() {
+      const html = document.documentElement;
+      html.dataset.theme = html.dataset.theme === "dark" ? "light" : "dark";
+      localStorage.setItem("sow-theme", html.dataset.theme);
+    };
+    (function(){const t = localStorage.getItem("sow-theme");if(t) document.documentElement.dataset.theme = t;})();
+  </script>
+</body>
+</html>
