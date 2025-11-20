@@ -466,25 +466,73 @@ function commitInterimToFinal(){
   if(t) { interimBuffer=""; transcriptUI.setInterim(""); transcriptUI.addFinalLine(t); finalSegments.push(t); }
 }
 
-function openNativeRecognizer(){
-  const ASR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!ASR){ transcriptUI.setInterim("Listening…"); return; }
-  const r=new ASR(); r.lang="en-US"; r.continuous=true; r.interimResults=true; r.maxAlternatives=1;
-  r.onresult=(e)=>{
-    let interim="";
-    for(let i=e.resultIndex;i<e.results.length;i++){
-      const res=e.results[i]; const txt=(res[0]?.transcript||"").trim(); if(!txt) continue;
-      if(res.isFinal){ transcriptUI.addFinalLine(txt); finalSegments.push(txt); interimBuffer=""; }
-      else interim += (interim?" ":"")+txt;
+function openNativeRecognizer() {
+  const ASR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  log("ASR available?", !!ASR, ASR);
+  if (!ASR) {
+    warn("Web Speech API not available; falling back to no live captions.");
+    transcriptUI.setInterim("Listening…");
+    return;
+  }
+
+  const r = new ASR();
+  r.lang = "en-US";
+  r.continuous = true;
+  r.interimResults = true;
+  r.maxAlternatives = 1;
+
+  r.onresult = (e) => {
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const res = e.results[i];
+      const txt = (res[0]?.transcript || "").trim();
+      if (!txt) continue;
+
+      if (res.isFinal) {
+        log("ASR final:", txt);
+        transcriptUI.addFinalLine(txt);
+        finalSegments.push(txt);
+        interimBuffer = "";
+      } else {
+        interim += (interim ? " " : "") + txt;
+      }
     }
     transcriptUI.setInterim(interim);
     interimBuffer = interim;
   };
-  r.onend=()=>{ if(isCalling && isRecording) { try{ r.start(); }catch{} } };
-  try{ r.start(); }catch{}
-  speechRecognizer=r;
+
+  r.onerror = (e) => {
+    warn("ASR error:", e);
+    // If the user blocked mic or Chrome is in a weird state, don’t spam restarts
+    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      closeNativeRecognizer();
+    }
+  };
+
+  r.onend = () => {
+    log("ASR onend; isCalling=", isCalling, "isRecording=", isRecording);
+    // Chrome often stops after a pause – restart while we’re still in a turn
+    if (isCalling && isRecording) {
+      try {
+        r.start();
+        log("ASR restarted");
+      } catch (err) {
+        warn("ASR restart failed:", err);
+      }
+    }
+  };
+
+  try {
+    r.start();
+    log("ASR start() called");
+  } catch (err) {
+    warn("ASR start() threw immediately:", err);
+  }
+
+  speechRecognizer = r;
 }
-function closeNativeRecognizer(){ try{ if(speechRecognizer){ const r=speechRecognizer; speechRecognizer=null; r.onend=null; r.stop(); } }catch{} }
+
 
 async function captureOneTurn(){
   if(!isCalling || isRecording || isPlayingAI) return false;
