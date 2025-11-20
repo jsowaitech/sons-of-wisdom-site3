@@ -533,6 +533,18 @@ function openNativeRecognizer() {
   speechRecognizer = r;
 }
 
+function closeNativeRecognizer() {
+  try {
+    if (speechRecognizer) {
+      const r = speechRecognizer;
+      speechRecognizer = null;
+      r.onend = null;
+      r.stop();
+    }
+  } catch (e) {
+    warn("closeNativeRecognizer error:", e);
+  }
+}
 
 async function captureOneTurn(){
   if(!isCalling || isRecording || isPlayingAI) return false;
