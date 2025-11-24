@@ -1,0 +1,10 @@
+[build]
+  # No framework build, just install deps (for potential functions, etc.)
+  command = "npm install"
+  publish = "."
+
+# Route /api/chat requests from the browser to the Netlify Function
+[[redirects]]
+  from = "/api/chat"
+  to   = "/.netlify/functions/chat"
+  status = 200

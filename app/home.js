@@ -11,17 +11,19 @@ const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 
 /* ------------------------------ config -------------------------------- */
-// Backend endpoint (when using your server/proxy)
+// Backend endpoint (when using your server/proxy OR Netlify Function)
 const CHAT_URL = "/api/chat";
 
 // DEV toggle: call OpenAI directly from the browser (no server).
-// ⚠️ For development ONLY — do not ship with this enabled.
-const DEV_DIRECT_OPENAI = true;
-const DEV_OPENAI_MODEL  = "gpt-4o-mini";
+// ⚠️ For development ONLY — never enable this on production.
+const DEV_DIRECT_OPENAI = false;
 
-// DEV ONLY: key comes from dev-local.js (or stays empty in prod)
-const DEV_OPENAI_KEY = (window.OPENAI_DEV_KEY || "").trim();
-
+// For dev, we read these from window.* so we never hardcode secrets in Git.
+// Create app/dev-local.js (gitignored) and set:
+//   window.OPENAI_DEV_KEY = "sk-...";
+//   window.OPENAI_MODEL   = "gpt-4o-mini";
+const DEV_OPENAI_MODEL = window.OPENAI_MODEL || "gpt-4o-mini";
+const DEV_OPENAI_KEY   = window.OPENAI_DEV_KEY || "";
 
 // Your System Prompt (kept exactly as provided)
 const DEV_SYSTEM_PROMPT = `
@@ -163,12 +165,15 @@ async function chatRequest(text, meta = {}) {
   if (DEV_DIRECT_OPENAI) {
     return chatDirectOpenAI(text, meta);
   }
-  // Server path (unchanged)
+
+  // Server / Netlify path
   const res = await fetch(CHAT_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, meta }),
+    // IMPORTANT: use "message" so both Express server.js and Netlify function work
+    body: JSON.stringify({ message: text, meta }),
   });
+
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     throw new Error(`Chat ${res.status}: ${t || res.statusText}`);
@@ -179,10 +184,12 @@ async function chatRequest(text, meta = {}) {
 
 /* ---- DEV ONLY: direct browser call to OpenAI (no server) ---- */
 async function chatDirectOpenAI(text, meta = {}) {
-  // 1) Use the hardcoded dev key (no prompts)
+  // 1) Use the dev key from window (via dev-local.js). Never hardcode secrets here.
   const key = (DEV_OPENAI_KEY || "").trim();
   if (!key) {
-    throw new Error("Missing OpenAI key. Set DEV_OPENAI_KEY in app/home.js for dev use.");
+    throw new Error(
+      "Missing OpenAI key. For dev-only browser calls, set window.OPENAI_DEV_KEY in app/dev-local.js."
+    );
   }
 
   // 2) Build messages with your system prompt
@@ -190,8 +197,8 @@ async function chatDirectOpenAI(text, meta = {}) {
   const history = Array.isArray(meta.history) ? meta.history : [];
   const messages = [
     { role: "system", content: systemPrompt },
-    ...history.map(m => ({ role: m.role, content: m.content })),
-    { role: "user", content: text }
+    ...history.map((m) => ({ role: m.role, content: m.content })),
+    { role: "user", content: text },
   ];
 
   // 3) Fire request
@@ -200,10 +207,10 @@ async function chatDirectOpenAI(text, meta = {}) {
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${key}`,
-      "Content-Type": "application/json"
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
@@ -250,6 +257,8 @@ async function handleSend() {
 }
 
 /* -------------------------- SPEAK (record) ---------------------------- */
+// (unchanged audio-recording code from your existing file)
+
 function pickSupportedMime() {
   const candidates = [
     { mime: "audio/webm;codecs=opus", ext: "webm" },
@@ -285,7 +294,7 @@ async function startRecording() {
       // appendAudioBubble("user", URL.createObjectURL(blob), "Your recording");
       await uploadRecordedAudio(blob, chosenMime.ext);
       // cleanup
-      mediaStream.getTracks().forEach(t => t.stop());
+      mediaStream.getTracks().forEach((t) => t.stop());
       mediaStream = null;
       mediaRecorder = null;
       mediaChunks = [];

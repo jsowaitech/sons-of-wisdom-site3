@@ -17,8 +17,7 @@ const HumeRealtime = (window.HumeRealtime ?? {
 HumeRealtime.init?.({ enable: false });
 
 const SUPABASE_URL = "https://plrobtlpedniyvkpwdmp.supabase.co";
-const SUPABASE_SERVICE_ROLE_KEY =
-  window.SUPABASE_SERVICE_ROLE_KEY || "";
+const SUPABASE_SERVICE_ROLE_KEY = window.SUPABASE_SERVICE_ROLE_KEY || "";
 
 const SUPABASE_BUCKET = "audiossow";
 const RECORDINGS_FOLDER = "recordings";
@@ -1070,27 +1069,33 @@ async function playAIWithBargeIn(
   });
 }
 
-/* ---------- Voice path: upload → n8n → play AI ---------- */
+/* ---------- Voice path: upload → Supabase → n8n (transcript only) ---------- */
 const RECENT_USER_KEEP = 12;
 let recentUserTurns = [];
 
+// Upload audio to Supabase, but send ONLY transcript + context to n8n
 async function uploadRecordingAndNotify() {
   if (!isCalling) return false;
 
+  // 1) Build combined transcript from interim + final text
   const finalText = finalSegments.join(" ").trim();
   const interimText = (interimBuffer || "").trim();
   const combinedTranscript = finalText || interimText || "";
+
   if (combinedTranscript) {
     recentUserTurns.push(combinedTranscript);
-    if (recentUserTurns.length > RECENT_USER_KEEP)
+    if (recentUserTurns.length > RECENT_USER_KEEP) {
       recentUserTurns.splice(
         0,
         recentUserTurns.length - RECENT_USER_KEEP
       );
+    }
   }
 
   const user_id = getUserIdForWebhook();
   const device = getOrCreateDeviceId();
+
+  // 2) Build audio blob (for Supabase only)
   const mimeType = mediaRecorder?.mimeType || "audio/webm";
   const blob = new Blob(recordChunks, { type: mimeType });
   if (!blob.size || !isCalling) {
@@ -1100,14 +1105,17 @@ async function uploadRecordingAndNotify() {
 
   statusText.textContent = "Thinking…";
 
-  // history/summary
+  // 3) History + rolling summary
   let historyPairsText = "",
     historyPairs = [];
   try {
     const hist = await fetchLastPairsFromSupabase(user_id, { pairs: 8 });
     historyPairsText = hist.text || "";
     historyPairs = hist.pairs || [];
-  } catch {}
+  } catch {
+    // ignore
+  }
+
   const prevSummary = await fetchRollingSummary(user_id, device);
   const rollingSummary = buildRollingSummary(
     prevSummary,
@@ -1121,7 +1129,7 @@ async function uploadRecordingAndNotify() {
       )} pairs), oldest→newest:\n${historyPairsText}\n\nUser now says:\n${combinedTranscript}`
     : combinedTranscript;
 
-  // upload to storage
+  // 4) Upload audio to Supabase storage (archive only)
   const ext = mimeType.includes("mp4") ? "m4a" : "webm";
   const filePath = `${RECORDINGS_FOLDER}/${device}/${Date.now()}.${ext}`;
   const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(
@@ -1141,25 +1149,21 @@ async function uploadRecordingAndNotify() {
     return false;
   }
 
-  // call n8n (expects BINARY audio back)
+  // 5) Call n8n with TEXT ONLY – no audio URL or file path
   let aiPlayableUrl = null,
     revokeLater = null,
     aiBlob = null,
     aiTextFromJSON = "";
+
   try {
     const body = {
-      bucket: SUPABASE_BUCKET,
-      filePath,
-      publicUrl: `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(
-        SUPABASE_BUCKET
-      )}/${filePath}`,
       user_id,
       transcript: transcriptForModel,
       has_transcript: !!transcriptForModel,
       history_user_last3: recentUserTurns.slice(-3),
       rolling_summary: rollingSummary || undefined,
       executionMode: "production",
-      source: "voice",
+      source: "voice-transcript-only",
     };
 
     const resp = await fetch(N8N_WEBHOOK_URL, {
@@ -1231,7 +1235,7 @@ async function uploadRecordingAndNotify() {
     return false;
   }
 
-  // If JSON gave us text and chat is open, type it
+  // 6) If JSON gave us text and chat is open, type it
   let aiBubble = null;
   if (inChatView) {
     aiBubble = appendMsg("ai", "", { typing: true });
