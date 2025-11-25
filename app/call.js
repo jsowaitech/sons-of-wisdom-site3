@@ -1,7 +1,7 @@
 // app/call.js
 // Son of Wisdom — Call mode
-// Continuous VAD recording → Supabase storage → n8n (transcript-only) → AI audio reply
-// Web Speech API captions + optional Hume realtime (safely stubbed)
+// Continuous VAD recording → Supabase storage + n8n → AI audio reply
+// Web Speech captions, barge-in interrupt, and dynamic ElevenLabs greeting.
 
 /* ---------- CONFIG ---------- */
 const DEBUG = true;
@@ -16,42 +16,36 @@ const HumeRealtime = (window.HumeRealtime ?? {
 // disabled by default – turn on inside your Hume dashboard if needed
 HumeRealtime.init?.({ enable: false });
 
-/* Supabase storage + history */
+/* Supabase storage (audio + history/summary) */
 const SUPABASE_URL = "https://plrobtlpedniyvkpwdmp.supabase.co";
-const SUPABASE_SERVICE_ROLE_KEY =
-  window.SUPABASE_SERVICE_ROLE_KEY || "";
+// pulled from dev-local.js (local) or Netlify snippet/runtime (prod)
+const SUPABASE_SERVICE_ROLE_KEY = window.SUPABASE_SERVICE_ROLE_KEY || "";
 
-// NOTE: keep bucket/folder names in sync with Supabase
 const SUPABASE_BUCKET = "audiossow";
 const RECORDINGS_FOLDER = "recordings";
 
-/* Supabase REST (history/summary) */
 const SUPABASE_REST = `${SUPABASE_URL}/rest/v1`;
 const HISTORY_TABLE = "call_sessions";
 const HISTORY_USER_COL = "user_id_uuid";
 const HISTORY_SELECT = "input_transcript,ai_text,timestamp";
 const HISTORY_TIME_COL = "timestamp";
 
-/* Dev override for history user id */
-const USER_UUID_OVERRIDE = null;
+const SUMMARY_TABLE = "history_summaries";
+const SUMMARY_MAX_CHARS = 380;
 
-/* n8n webhooks (for main coaching logic) */
+/* n8n webhooks (voice + optional AI-transcript) */
 const N8N_WEBHOOK_URL =
+  window.N8N_VOICE_WEBHOOK_URL ||
   "https://jsonofwisdom.app.n8n.cloud/webhook/4877ebea-544b-42b4-96d6-df41c58d48b0";
+const N8N_TRANSCRIBE_URL = window.N8N_TRANSCRIBE_URL || "";
 
-/* Optional: AI-transcript webhook for AI reply captions (unused by default) */
-const N8N_TRANSCRIBE_URL = "";
+/* Netlify greeting function (OpenAI + ElevenLabs) */
+const CALL_GREETING_ENDPOINT = "/.netlify/functions/call-greeting";
 
-/* Only send transcript + metadata to n8n (no audio) */
-const SEND_AUDIO_TO_N8N = false;
-
-/* I/O tuning */
+/* I/O tunables */
 const ENABLE_MEDIARECORDER_64KBPS = true;
 const TIMESLICE_MS = 100;
 const ENABLE_STREAMED_PLAYBACK = true;
-
-/* Greeting Netlify Function (OpenAI + ElevenLabs) */
-const GREETING_URL = "/.netlify/functions/call-greeting";
 
 /* ---------- USER / DEVICE ---------- */
 const USER_ID_KEY = "sow_user_id";
@@ -79,11 +73,7 @@ function getUserIdForWebhook() {
 }
 
 const pickUuidForHistory = (user_id) =>
-  USER_UUID_OVERRIDE && isUuid(USER_UUID_OVERRIDE)
-    ? USER_UUID_OVERRIDE
-    : isUuid(user_id)
-    ? user_id
-    : SENTINEL_UUID;
+  isUuid(user_id) ? user_id : SENTINEL_UUID;
 
 /* ---------- DOM ---------- */
 const callBtn = document.getElementById("call-btn");
@@ -111,7 +101,7 @@ let globalStream = null;
 let mediaRecorder = null;
 let recordChunks = [];
 
-/* Native ASR for user live captions */
+/* SpeechRecognition (native captions) */
 const HAS_NATIVE_ASR =
   "SpeechRecognition" in window || "webkitSpeechRecognition" in window;
 let speechRecognizer = null;
@@ -120,8 +110,12 @@ let speechRecognizer = null;
 let playbackAC = null;
 const managedAudios = new Set();
 let preferredOutputDeviceId = null;
-let micMuted = false,
-  speakerMuted = false;
+let micMuted = false;
+let speakerMuted = false;
+
+/* Greeting cache */
+let greetingBlobUrl = null;
+let greetingPrefetchPromise = null;
 
 /* ---------- Helpers ---------- */
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -131,8 +125,6 @@ const trimText = (s, n = 360) => (s || "").trim().slice(0, n);
 /* ---------- History / Summary (Supabase via REST) ---------- */
 async function fetchLastPairsFromSupabase(user_id, { pairs = 8 } = {}) {
   try {
-    if (!SUPABASE_SERVICE_ROLE_KEY) return { text: "", pairs: [] };
-
     const uuid = pickUuidForHistory(user_id);
     const url = new URL(
       `${SUPABASE_REST}/${encodeURIComponent(HISTORY_TABLE)}`
@@ -163,18 +155,14 @@ async function fetchLastPairsFromSupabase(user_id, { pairs = 8 } = {}) {
       })
       .join("\n\n");
     return { text: textBlock, pairs: lastPairs };
-  } catch (err) {
-    warn("fetchLastPairsFromSupabase failed", err);
+  } catch (e) {
+    warn("fetchLastPairsFromSupabase error", e);
     return { text: "", pairs: [] };
   }
 }
 
-const SUMMARY_TABLE = "history_summaries";
-const SUMMARY_MAX_CHARS = 380;
-
 async function fetchRollingSummary(user_id, device) {
   try {
-    if (!SUPABASE_SERVICE_ROLE_KEY) return "";
     const uuid = pickUuidForHistory(user_id);
     const url = new URL(
       `${SUPABASE_REST}/${encodeURIComponent(SUMMARY_TABLE)}`
@@ -192,15 +180,14 @@ async function fetchRollingSummary(user_id, device) {
     if (!resp.ok) return "";
     const rows = await resp.json();
     return rows?.[0]?.summary || "";
-  } catch (err) {
-    warn("fetchRollingSummary failed", err);
+  } catch (e) {
+    warn("fetchRollingSummary error", e);
     return "";
   }
 }
 
 async function upsertRollingSummary(user_id, device, summary) {
   try {
-    if (!SUPABASE_SERVICE_ROLE_KEY || !summary) return;
     const uuid = pickUuidForHistory(user_id);
     const body = [
       {
@@ -220,17 +207,12 @@ async function upsertRollingSummary(user_id, device, summary) {
       },
       body: JSON.stringify(body),
     });
-  } catch (err) {
-    warn("upsertRollingSummary failed", err);
+  } catch (e) {
+    warn("upsertRollingSummary error", e);
   }
 }
 
-function buildRollingSummary(
-  prevSummary,
-  pairs,
-  newest,
-  maxChars = SUMMARY_MAX_CHARS
-) {
+function buildRollingSummary(prevSummary, pairs, newest, maxChars = SUMMARY_MAX_CHARS) {
   const sentences = [];
   if (prevSummary) sentences.push(prevSummary);
   for (const p of pairs.slice(-6)) {
@@ -244,8 +226,7 @@ function buildRollingSummary(
       const t = s.trim().replace(/\s+/g, " ");
       let score = 0;
       if (/[0-9]/.test(t)) score += 1;
-      if (/(goal|need|want|plan|decide|next|todo|fix|issue)/i.test(t))
-        score += 2;
+      if (/(goal|need|want|plan|decide|next|todo|fix|issue)/i.test(t)) score += 2;
       if (t.length >= 40 && t.length <= 160) score += 1;
       if (/^User now:/i.test(t)) score += 3;
       return { t, score };
@@ -263,9 +244,7 @@ function buildRollingSummary(
     if (used >= maxChars - 24) break;
   }
   const summary = out.join(" ").trim();
-  return summary.length
-    ? summary
-    : sentences.join(" ").slice(-maxChars);
+  return summary.length ? summary : sentences.join(" ").slice(-maxChars);
 }
 
 /* ---------- UI: Chat ---------- */
@@ -308,7 +287,7 @@ ensureChatUI();
 
 function showChatView() {
   inChatView = true;
-  if (chatPanel) chatPanel.style.display = "block";
+  chatPanel.style.display = "block";
   statusText.textContent = "Chat view on. Call continues in background.";
   updateModeBtnUI();
 }
@@ -656,66 +635,51 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-/* ---------- Greeting via Netlify Function ---------- */
-async function playDynamicGreeting() {
-  try {
-    const user_id = getUserIdForWebhook();
-    const device = getOrCreateDeviceId();
+/* ---------- Greeting prefetch & playback ---------- */
 
-    const resp = await fetch(GREETING_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id, device_id: device }),
-    });
+async function prefetchGreetingIfNeeded() {
+  if (greetingBlobUrl) return true;
+  if (greetingPrefetchPromise) return greetingPrefetchPromise;
 
-    if (!resp.ok) {
-      warn("Greeting function failed", resp.status);
-      return false;
-    }
-
-    const ct = (resp.headers.get("content-type") || "").toLowerCase();
-    let audioUrl = null;
-    let revoke = null;
-
-    if (ct.startsWith("audio/") || ct === "application/octet-stream") {
+  greetingPrefetchPromise = (async () => {
+    if (!CALL_GREETING_ENDPOINT) return false;
+    try {
+      const resp = await fetch(CALL_GREETING_ENDPOINT, { method: "POST" });
+      if (!resp.ok) throw new Error(`status ${resp.status}`);
       const blob = await resp.blob();
-      if (!blob.size) return false;
-      audioUrl = URL.createObjectURL(blob);
-      revoke = audioUrl;
-    } else if (ct.includes("application/json")) {
-      const data = await resp.json().catch(() => null);
-      const b64 = data?.audio_base64;
-      const url =
-        data?.audio_url ||
-        data?.audioUrl ||
-        data?.url ||
-        data?.fileUrl ||
-        null;
-      if (url) {
-        audioUrl = url;
-      } else if (b64) {
-        const raw = b64.includes(",") ? b64.split(",").pop() : b64;
-        const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
-        const blob = new Blob([bytes], { type: data?.mime || "audio/mpeg" });
-        audioUrl = URL.createObjectURL(blob);
-        revoke = audioUrl;
+      if (!blob.size) throw new Error("empty greeting audio");
+
+      if (greetingBlobUrl) {
+        try {
+          URL.revokeObjectURL(greetingBlobUrl);
+        } catch {}
       }
-    } else {
-      warn("Unexpected greeting content-type:", ct);
+      greetingBlobUrl = URL.createObjectURL(blob);
+      log("Greeting audio prefetched.");
+      return true;
+    } catch (e) {
+      warn("Greeting prefetch failed", e);
+      greetingBlobUrl = null;
       return false;
+    } finally {
+      greetingPrefetchPromise = null;
     }
+  })();
 
-    if (!audioUrl) return false;
+  return greetingPrefetchPromise;
+}
 
-    const ok = await safePlayOnce(audioUrl, { limitMs: 60000 });
-    if (revoke) {
-      try {
-        URL.revokeObjectURL(revoke);
-      } catch {}
-    }
-    return ok;
-  } catch (err) {
-    warn("playDynamicGreeting error", err);
+async function playGreetingFromCache() {
+  const ok = await prefetchGreetingIfNeeded();
+  if (!ok || !greetingBlobUrl) return false;
+  try {
+    const played = await safePlayOnce(greetingBlobUrl, {
+      limitMs: 60000,
+      color: "#d4a373",
+    });
+    return !!played;
+  } catch (e) {
+    warn("Greeting playback failed", e);
     return false;
   }
 }
@@ -730,22 +694,33 @@ async function startCall() {
 
   try {
     statusText.textContent = "Ringing…";
+
+    // 🔔 Ring #1
     await safePlayOnce("ring.mp3", { limitMs: 15000 });
     if (!isCalling) return;
 
-    statusText.textContent = "Solomon is greeting you…";
-    const greeted = await playDynamicGreeting();
+    // 🔔 Ring #2
+    await safePlayOnce("ring.mp3", { limitMs: 15000 });
     if (!isCalling) return;
 
-    if (!greeted) {
-      // fallback if function fails
-      await safePlayOnce("blake.mp3", { limitMs: 15000 });
-      if (!isCalling) return;
+    // 🔊 Dynamic greeting (cached from Netlify/ElevenLabs)
+    statusText.textContent = "AI is greeting you…";
+    let okGreeting = await playGreetingFromCache();
+
+    // Optional: fallback to static greeting if dynamic fails
+    if (!okGreeting) {
+      warn("Dynamic greeting unavailable, falling back to blake.mp3");
+      try {
+        okGreeting = await safePlayOnce("blake.mp3", { limitMs: 15000 });
+      } catch (e) {
+        warn("Fallback greeting failed", e);
+      }
     }
+    if (!isCalling) return;
 
     await startRecordingLoop();
-  } catch (err) {
-    warn("startCall error", err);
+  } catch (e) {
+    warn("startCall error", e);
     statusText.textContent = "Audio blocked or missing. Tap again.";
   }
 }
@@ -780,7 +755,7 @@ function endCall() {
   }
 }
 
-/* Small one-shot clips (ring/greeting) */
+/* Small one-shot clips (ring/greeting/etc.) */
 function safePlayOnce(
   src,
   { limitMs = 15000, color = "#d4a373" } = {}
@@ -943,12 +918,10 @@ async function captureOneTurn() {
     let opts = {};
     if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
       opts.mimeType = "audio/webm;codecs=opus";
-      if (ENABLE_MEDIARECORDER_64KBPS)
-        opts.audioBitsPerSecond = 64_000;
+      if (ENABLE_MEDIARECORDER_64KBPS) opts.audioBitsPerSecond = 64_000;
     } else if (MediaRecorder.isTypeSupported("audio/webm")) {
       opts.mimeType = "audio/webm";
-      if (ENABLE_MEDIARECORDER_64KBPS)
-        opts.audioBitsPerSecond = 64_000;
+      if (ENABLE_MEDIARECORDER_64KBPS) opts.audioBitsPerSecond = 64_000;
     }
     try {
       mediaRecorder = new MediaRecorder(stream, opts);
@@ -987,10 +960,9 @@ async function captureOneTurn() {
       wait();
     });
     return true;
-  } catch (err) {
-    warn("captureOneTurn error", err);
-    statusText.textContent =
-      "Mic permission or codec not supported.";
+  } catch (e) {
+    warn("captureOneTurn error", e);
+    statusText.textContent = "Mic permission or codec not supported.";
     endCall();
     return false;
   }
@@ -1015,9 +987,7 @@ async function ensureLiveMicForBargeIn() {
   try {
     if (
       globalStream &&
-      globalStream
-        .getAudioTracks()
-        .some((t) => t.readyState === "live")
+      globalStream.getAudioTracks().some((t) => t.readyState === "live")
     ) {
       globalStream.getAudioTracks().forEach((t) => {
         if (t.enabled === false) t.enabled = true;
@@ -1119,9 +1089,13 @@ async function playAIWithBargeIn(
     registerAudioElement(a);
     animateRingFromElement(a, "#d4a373");
 
-    // optional AI transcript webhook (currently disabled; blob is not sent to n8n)
-    if (!aiBubbleEl && inChatView)
-      aiBubbleEl = appendMsg("ai", "", { typing: true });
+    // live transcription webhook if configured
+    if (!aiBubbleEl && inChatView) aiBubbleEl = appendMsg("ai", "", { typing: true });
+    if (aiBlob && N8N_TRANSCRIBE_URL) {
+      try {
+        liveTranscribeBlob(aiBlob, aiBubbleEl).catch(() => {});
+      } catch {}
+    }
 
     const okMic = await ensureLiveMicForBargeIn();
 
@@ -1153,7 +1127,7 @@ async function playAIWithBargeIn(
   });
 }
 
-/* ---------- Voice path: upload → Supabase → n8n (transcript only) ---------- */
+/* ---------- Voice path: upload → n8n → play AI ---------- */
 const RECENT_USER_KEEP = 12;
 let recentUserTurns = [];
 
@@ -1204,43 +1178,38 @@ async function uploadRecordingAndNotify() {
       )} pairs), oldest→newest:\n${historyPairsText}\n\nUser now says:\n${combinedTranscript}`
     : combinedTranscript;
 
-  // upload to Supabase storage (for your own logging/analysis)
-  let publicUrl = "";
-  try {
-    if (SUPABASE_SERVICE_ROLE_KEY) {
-      const ext = mimeType.includes("mp4") ? "m4a" : "webm";
-      const filePath = `${RECORDINGS_FOLDER}/${device}/${Date.now()}.${ext}`;
-      const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(
-        SUPABASE_BUCKET
-      )}/${filePath}`;
-      const upRes = await fetch(uploadUrl, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-          "Content-Type": blob.type || "application/octet-stream",
-          "x-upsert": "false",
-        },
-        body: blob,
-      });
-      if (upRes.ok) {
-        publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(
-          SUPABASE_BUCKET
-        )}/${filePath}`;
-      } else {
-        warn("Supabase upload failed", upRes.status);
-      }
-    }
-  } catch (err) {
-    warn("Supabase upload error", err);
+  // upload to Supabase storage
+  const ext = mimeType.includes("mp4") ? "m4a" : "webm";
+  const filePath = `${RECORDINGS_FOLDER}/${device}/${Date.now()}.${ext}`;
+  const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(
+    SUPABASE_BUCKET
+  )}/${filePath}`;
+  const upRes = await fetch(uploadUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": blob.type || "application/octet-stream",
+      "x-upsert": "false",
+    },
+    body: blob,
+  });
+  if (!upRes.ok || !isCalling) {
+    statusText.textContent = `Upload failed (${upRes.status}).`;
+    return false;
   }
 
-  // call n8n with transcript ONLY (no audio blob)
+  // call n8n – ONLY transcript + metadata (no raw audio body)
   let aiPlayableUrl = null,
     revokeLater = null,
     aiBlob = null,
     aiTextFromJSON = "";
   try {
     const body = {
+      bucket: SUPABASE_BUCKET,
+      filePath,
+      publicUrl: `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(
+        SUPABASE_BUCKET
+      )}/${filePath}`,
       user_id,
       transcript: transcriptForModel,
       has_transcript: !!transcriptForModel,
@@ -1248,8 +1217,6 @@ async function uploadRecordingAndNotify() {
       rolling_summary: rollingSummary || undefined,
       executionMode: "production",
       source: "voice",
-      // optional reference to stored audio (but not sending audio itself)
-      audio_storage_url: publicUrl || undefined,
     };
 
     const resp = await fetch(N8N_WEBHOOK_URL, {
@@ -1268,9 +1235,7 @@ async function uploadRecordingAndNotify() {
     ) {
       const ok = await playStreamedWebmOpus(resp.clone());
       if (ok) {
-        upsertRollingSummary(user_id, device, rollingSummary).catch(
-          () => {}
-        );
+        upsertRollingSummary(user_id, device, rollingSummary).catch(() => {});
         return true;
       }
     }
@@ -1343,30 +1308,59 @@ async function uploadRecordingAndNotify() {
 }
 
 /* ---------- Live-transcribe the AI Blob through optional webhook ---------- */
-/**
- * Optional: send the AI's audio reply to a transcription webhook
- * and stream it into the same bubble.
- *
- * Currently not wired to n8n (we're not sending AI audio anywhere).
- */
 async function liveTranscribeBlob(blob, aiBubbleEl) {
   if (!N8N_TRANSCRIBE_URL) return;
+
+  const trySSE = async () => {
+    const resp = await fetch(N8N_TRANSCRIBE_URL, {
+      method: "POST",
+      headers: { Accept: "text/event-stream" },
+      body: await blobToFormData(blob, "file", "ai.mp3"),
+    });
+    const ct = (resp.headers.get("content-type") || "").toLowerCase();
+    if (!ct.includes("text/event-stream")) return false;
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let full = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      for (const line of chunk.split(/\r?\n/)) {
+        if (!line.startsWith("data:")) continue;
+        const json = line.slice(5).trim();
+        if (!json) continue;
+        try {
+          const evt = JSON.parse(json);
+          if (evt.delta) {
+            full += evt.delta;
+            if (aiBubbleEl) aiBubbleEl.textContent = full;
+          }
+          if (evt.text && evt.done) {
+            if (aiBubbleEl) aiBubbleEl.textContent = evt.text;
+            return true;
+          }
+        } catch {}
+      }
+    }
+    return !!full;
+  };
+
+  const sseOk = await trySSE().catch(() => false);
+  if (sseOk) return;
+
   try {
     const resp = await fetch(N8N_TRANSCRIBE_URL, {
       method: "POST",
       body: await blobToFormData(blob, "file", "ai.mp3"),
     });
     const data = await resp.json().catch(() => null);
-    const text =
-      data?.text ||
-      data?.transcript ||
-      data?.message ||
-      "";
+    const text = data?.text || data?.transcript || "";
     if (text && aiBubbleEl) {
       await typewriter(aiBubbleEl, text, 18);
     }
-  } catch (err) {
-    warn("liveTranscribeBlob failed", err);
+  } catch (e) {
+    warn("liveTranscribeBlob error", e);
   }
 }
 
@@ -1578,3 +1572,6 @@ updateMicUI();
 updateSpeakerUI();
 updateModeBtnUI();
 showCallView();
+
+// prefetch greeting as soon as call.html loads (no audio yet)
+prefetchGreetingIfNeeded().catch(() => {});
