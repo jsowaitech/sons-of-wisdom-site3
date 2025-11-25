@@ -1,7 +1,6 @@
 // app/call.js
 // Son of Wisdom — Call mode
-// Continuous VAD recording → Supabase storage (audio) + n8n (transcript only) → AI audio reply
-// Dynamic AI greeting via Netlify Function + OpenAI
+// Continuous VAD recording → Supabase storage → n8n (transcript-only) → AI audio reply
 // Web Speech API captions + optional Hume realtime (safely stubbed)
 
 /* ---------- CONFIG ---------- */
@@ -17,11 +16,12 @@ const HumeRealtime = (window.HumeRealtime ?? {
 // disabled by default – turn on inside your Hume dashboard if needed
 HumeRealtime.init?.({ enable: false });
 
-// Supabase — service role key must NOT be hardcoded here in production.
-// For local dev you can inject via dev-local.js as window.SUPABASE_SERVICE_ROLE_KEY.
+/* Supabase storage + history */
 const SUPABASE_URL = "https://plrobtlpedniyvkpwdmp.supabase.co";
-const SUPABASE_SERVICE_ROLE_KEY = window.SUPABASE_SERVICE_ROLE_KEY || "";
+const SUPABASE_SERVICE_ROLE_KEY =
+  window.SUPABASE_SERVICE_ROLE_KEY || "";
 
+// NOTE: keep bucket/folder names in sync with Supabase
 const SUPABASE_BUCKET = "audiossow";
 const RECORDINGS_FOLDER = "recordings";
 
@@ -32,20 +32,26 @@ const HISTORY_USER_COL = "user_id_uuid";
 const HISTORY_SELECT = "input_transcript,ai_text,timestamp";
 const HISTORY_TIME_COL = "timestamp";
 
-/* Dev override */
+/* Dev override for history user id */
 const USER_UUID_OVERRIDE = null;
 
-/* n8n webhooks (transcript + metadata only) */
+/* n8n webhooks (for main coaching logic) */
 const N8N_WEBHOOK_URL =
   "https://jsonofwisdom.app.n8n.cloud/webhook/4877ebea-544b-42b4-96d6-df41c58d48b0";
 
-/* Optional: AI-transcript webhook (leave empty to disable) */
+/* Optional: AI-transcript webhook for AI reply captions (unused by default) */
 const N8N_TRANSCRIBE_URL = "";
 
-/* I/O */
+/* Only send transcript + metadata to n8n (no audio) */
+const SEND_AUDIO_TO_N8N = false;
+
+/* I/O tuning */
 const ENABLE_MEDIARECORDER_64KBPS = true;
 const TIMESLICE_MS = 100;
 const ENABLE_STREAMED_PLAYBACK = true;
+
+/* Greeting Netlify Function (OpenAI + ElevenLabs) */
+const GREETING_URL = "/.netlify/functions/call-greeting";
 
 /* ---------- USER / DEVICE ---------- */
 const USER_ID_KEY = "sow_user_id";
@@ -93,9 +99,7 @@ const transcriptInterim = document.getElementById("transcript-interim");
 
 // Chat (created lazily)
 let chatPanel = document.getElementById("chat-panel");
-let chatLog,
-  chatForm,
-  chatInput;
+let chatLog, chatForm, chatInput;
 
 /* ---------- State ---------- */
 let isCalling = false;
@@ -126,12 +130,9 @@ const trimText = (s, n = 360) => (s || "").trim().slice(0, n);
 
 /* ---------- History / Summary (Supabase via REST) ---------- */
 async function fetchLastPairsFromSupabase(user_id, { pairs = 8 } = {}) {
-  if (!SUPABASE_SERVICE_ROLE_KEY) {
-    // Supabase disabled in this environment
-    return { text: "", pairs: [] };
-  }
-
   try {
+    if (!SUPABASE_SERVICE_ROLE_KEY) return { text: "", pairs: [] };
+
     const uuid = pickUuidForHistory(user_id);
     const url = new URL(
       `${SUPABASE_REST}/${encodeURIComponent(HISTORY_TABLE)}`
@@ -162,7 +163,8 @@ async function fetchLastPairsFromSupabase(user_id, { pairs = 8 } = {}) {
       })
       .join("\n\n");
     return { text: textBlock, pairs: lastPairs };
-  } catch {
+  } catch (err) {
+    warn("fetchLastPairsFromSupabase failed", err);
     return { text: "", pairs: [] };
   }
 }
@@ -171,9 +173,8 @@ const SUMMARY_TABLE = "history_summaries";
 const SUMMARY_MAX_CHARS = 380;
 
 async function fetchRollingSummary(user_id, device) {
-  if (!SUPABASE_SERVICE_ROLE_KEY) return "";
-
   try {
+    if (!SUPABASE_SERVICE_ROLE_KEY) return "";
     const uuid = pickUuidForHistory(user_id);
     const url = new URL(
       `${SUPABASE_REST}/${encodeURIComponent(SUMMARY_TABLE)}`
@@ -191,15 +192,15 @@ async function fetchRollingSummary(user_id, device) {
     if (!resp.ok) return "";
     const rows = await resp.json();
     return rows?.[0]?.summary || "";
-  } catch {
+  } catch (err) {
+    warn("fetchRollingSummary failed", err);
     return "";
   }
 }
 
 async function upsertRollingSummary(user_id, device, summary) {
-  if (!SUPABASE_SERVICE_ROLE_KEY || !summary) return;
-
   try {
+    if (!SUPABASE_SERVICE_ROLE_KEY || !summary) return;
     const uuid = pickUuidForHistory(user_id);
     const body = [
       {
@@ -219,8 +220,8 @@ async function upsertRollingSummary(user_id, device, summary) {
       },
       body: JSON.stringify(body),
     });
-  } catch {
-    // non-fatal
+  } catch (err) {
+    warn("upsertRollingSummary failed", err);
   }
 }
 
@@ -307,7 +308,7 @@ ensureChatUI();
 
 function showChatView() {
   inChatView = true;
-  chatPanel.style.display = "block";
+  if (chatPanel) chatPanel.style.display = "block";
   statusText.textContent = "Chat view on. Call continues in background.";
   updateModeBtnUI();
 }
@@ -655,24 +656,16 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-/* ---------- Dynamic AI greeting via Netlify Function (OpenAI) ---------- */
-/**
- * Calls /.netlify/functions/greeting to get a fresh MP3 greeting.
- * Returns true if audio was successfully played.
- */
-async function playDynamicGreetingFromAPI() {
+/* ---------- Greeting via Netlify Function ---------- */
+async function playDynamicGreeting() {
   try {
-    statusText.textContent = "AI is greeting you…";
+    const user_id = getUserIdForWebhook();
+    const device = getOrCreateDeviceId();
 
-    // Optional payload: can pass name later if you want personalization
-    const body = {
-      // name: "Blake",
-    };
-
-    const resp = await fetch("/.netlify/functions/greeting", {
+    const resp = await fetch(GREETING_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ user_id, device_id: device }),
     });
 
     if (!resp.ok) {
@@ -681,15 +674,48 @@ async function playDynamicGreetingFromAPI() {
     }
 
     const ct = (resp.headers.get("content-type") || "").toLowerCase();
-    const blob = await resp.blob();
-    if (!blob.size) return false;
+    let audioUrl = null;
+    let revoke = null;
 
-    const url = URL.createObjectURL(blob);
-    const ok = await safePlayOnce(url, { limitMs: 25000 });
-    URL.revokeObjectURL(url);
+    if (ct.startsWith("audio/") || ct === "application/octet-stream") {
+      const blob = await resp.blob();
+      if (!blob.size) return false;
+      audioUrl = URL.createObjectURL(blob);
+      revoke = audioUrl;
+    } else if (ct.includes("application/json")) {
+      const data = await resp.json().catch(() => null);
+      const b64 = data?.audio_base64;
+      const url =
+        data?.audio_url ||
+        data?.audioUrl ||
+        data?.url ||
+        data?.fileUrl ||
+        null;
+      if (url) {
+        audioUrl = url;
+      } else if (b64) {
+        const raw = b64.includes(",") ? b64.split(",").pop() : b64;
+        const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
+        const blob = new Blob([bytes], { type: data?.mime || "audio/mpeg" });
+        audioUrl = URL.createObjectURL(blob);
+        revoke = audioUrl;
+      }
+    } else {
+      warn("Unexpected greeting content-type:", ct);
+      return false;
+    }
+
+    if (!audioUrl) return false;
+
+    const ok = await safePlayOnce(audioUrl, { limitMs: 60000 });
+    if (revoke) {
+      try {
+        URL.revokeObjectURL(revoke);
+      } catch {}
+    }
     return ok;
   } catch (err) {
-    warn("Dynamic greeting API error", err);
+    warn("playDynamicGreeting error", err);
     return false;
   }
 }
@@ -703,30 +729,23 @@ async function startCall() {
   showCallView();
 
   try {
-    // 1) Ring
     statusText.textContent = "Ringing…";
     await safePlayOnce("ring.mp3", { limitMs: 15000 });
     if (!isCalling) return;
 
-    // 2) Try dynamic AI greeting via Netlify + OpenAI
-    const greeted = await playDynamicGreetingFromAPI();
+    statusText.textContent = "Solomon is greeting you…";
+    const greeted = await playDynamicGreeting();
     if (!isCalling) return;
 
-    // 3) Fallback: local static greeting if function fails or is unavailable
     if (!greeted) {
-      statusText.textContent = "AI is greeting you…";
-      try {
-        await safePlayOnce("blake.mp3", { limitMs: 15000 });
-      } catch {
-        // ignore; we'll just move straight into listening
-      }
+      // fallback if function fails
+      await safePlayOnce("blake.mp3", { limitMs: 15000 });
+      if (!isCalling) return;
     }
 
-    if (!isCalling) return;
-
-    // 4) Start normal recording loop (user talks, transcript → n8n, etc.)
     await startRecordingLoop();
-  } catch {
+  } catch (err) {
+    warn("startCall error", err);
     statusText.textContent = "Audio blocked or missing. Tap again.";
   }
 }
@@ -782,7 +801,9 @@ function safePlayOnce(
     a.oncanplaythrough = () => {
       try {
         a.play().catch(() => res(false));
-      } catch {}
+      } catch {
+        res(false);
+      }
     };
     a.onerror = () => res(false);
     a.onabort = () => res(false);
@@ -966,7 +987,8 @@ async function captureOneTurn() {
       wait();
     });
     return true;
-  } catch {
+  } catch (err) {
+    warn("captureOneTurn error", err);
     statusText.textContent =
       "Mic permission or codec not supported.";
     endCall();
@@ -1097,14 +1119,9 @@ async function playAIWithBargeIn(
     registerAudioElement(a);
     animateRingFromElement(a, "#d4a373");
 
-    // live transcription webhook if configured
+    // optional AI transcript webhook (currently disabled; blob is not sent to n8n)
     if (!aiBubbleEl && inChatView)
       aiBubbleEl = appendMsg("ai", "", { typing: true });
-    if (aiBlob && N8N_TRANSCRIBE_URL) {
-      try {
-        liveTranscribeBlob(aiBlob, aiBubbleEl).catch(() => {});
-      } catch {}
-    }
 
     const okMic = await ensureLiveMicForBargeIn();
 
@@ -1136,16 +1153,10 @@ async function playAIWithBargeIn(
   });
 }
 
-/* ---------- Voice path: upload → Supabase (audio) + n8n (transcript JSON) ---------- */
+/* ---------- Voice path: upload → Supabase → n8n (transcript only) ---------- */
 const RECENT_USER_KEEP = 12;
 let recentUserTurns = [];
 
-/**
- * 1) Build transcript + context
- * 2) Upload audio to Supabase (if key available)
- * 3) Send JSON with transcript/metadata to n8n (NO audio blob)
- * 4) Play AI audio reply with barge-in
- */
 async function uploadRecordingAndNotify() {
   if (!isCalling) return false;
 
@@ -1172,16 +1183,14 @@ async function uploadRecordingAndNotify() {
 
   statusText.textContent = "Thinking…";
 
-  // history/summary (from Supabase if available)
+  // history/summary
   let historyPairsText = "",
     historyPairs = [];
   try {
     const hist = await fetchLastPairsFromSupabase(user_id, { pairs: 8 });
     historyPairsText = hist.text || "";
     historyPairs = hist.pairs || [];
-  } catch {
-    // non-fatal
-  }
+  } catch {}
   const prevSummary = await fetchRollingSummary(user_id, device);
   const rollingSummary = buildRollingSummary(
     prevSummary,
@@ -1195,17 +1204,15 @@ async function uploadRecordingAndNotify() {
       )} pairs), oldest→newest:\n${historyPairsText}\n\nUser now says:\n${combinedTranscript}`
     : combinedTranscript;
 
-  // 3) Upload raw audio ONLY to Supabase storage (no audio goes to n8n)
-  let filePath = null;
-  let publicUrl = null;
-  if (SUPABASE_SERVICE_ROLE_KEY) {
-    try {
+  // upload to Supabase storage (for your own logging/analysis)
+  let publicUrl = "";
+  try {
+    if (SUPABASE_SERVICE_ROLE_KEY) {
       const ext = mimeType.includes("mp4") ? "m4a" : "webm";
-      filePath = `${RECORDINGS_FOLDER}/${device}/${Date.now()}.${ext}`;
+      const filePath = `${RECORDINGS_FOLDER}/${device}/${Date.now()}.${ext}`;
       const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(
         SUPABASE_BUCKET
       )}/${filePath}`;
-
       const upRes = await fetch(uploadUrl, {
         method: "POST",
         headers: {
@@ -1215,41 +1222,36 @@ async function uploadRecordingAndNotify() {
         },
         body: blob,
       });
-
       if (upRes.ok) {
         publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(
           SUPABASE_BUCKET
         )}/${filePath}`;
       } else {
-        warn("Supabase upload failed:", upRes.status);
+        warn("Supabase upload failed", upRes.status);
       }
-    } catch (e) {
-      warn("Supabase upload error:", e);
     }
-  } else {
-    warn("SUPABASE_SERVICE_ROLE_KEY missing; skipping audio upload.");
+  } catch (err) {
+    warn("Supabase upload error", err);
   }
 
-  // 4) Build JSON payload for n8n – transcript + metadata ONLY (no audio blob)
-  const body = {
-    bucket: SUPABASE_BUCKET,
-    filePath,
-    publicUrl,
-    user_id,
-    transcript: transcriptForModel,
-    has_transcript: !!transcriptForModel,
-    history_user_last3: recentUserTurns.slice(-3),
-    rolling_summary: rollingSummary || undefined,
-    executionMode: "production",
-    source: "voice",
-  };
-
+  // call n8n with transcript ONLY (no audio blob)
   let aiPlayableUrl = null,
     revokeLater = null,
     aiBlob = null,
     aiTextFromJSON = "";
-
   try {
+    const body = {
+      user_id,
+      transcript: transcriptForModel,
+      has_transcript: !!transcriptForModel,
+      history_user_last3: recentUserTurns.slice(-3),
+      rolling_summary: rollingSummary || undefined,
+      executionMode: "production",
+      source: "voice",
+      // optional reference to stored audio (but not sending audio itself)
+      audio_storage_url: publicUrl || undefined,
+    };
+
     const resp = await fetch(N8N_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1275,12 +1277,10 @@ async function uploadRecordingAndNotify() {
 
     if (ct.startsWith("audio/") || ct === "application/octet-stream") {
       aiBlob = await resp.blob();
-      if (aiBlob.size) {
-        aiPlayableUrl = URL.createObjectURL(aiBlob);
-        revokeLater = aiPlayableUrl;
-      }
+      aiPlayableUrl = URL.createObjectURL(aiBlob);
+      revokeLater = aiPlayableUrl;
     } else if (ct.includes("application/json")) {
-      const data = await resp.json().catch(() => ({}));
+      const data = await resp.json();
       aiTextFromJSON =
         data?.text ?? data?.transcript ?? data?.message ?? "";
       const b64 = data?.audio_base64;
@@ -1343,58 +1343,31 @@ async function uploadRecordingAndNotify() {
 }
 
 /* ---------- Live-transcribe the AI Blob through optional webhook ---------- */
+/**
+ * Optional: send the AI's audio reply to a transcription webhook
+ * and stream it into the same bubble.
+ *
+ * Currently not wired to n8n (we're not sending AI audio anywhere).
+ */
 async function liveTranscribeBlob(blob, aiBubbleEl) {
   if (!N8N_TRANSCRIBE_URL) return;
-
-  const trySSE = async () => {
-    const resp = await fetch(N8N_TRANSCRIBE_URL, {
-      method: "POST",
-      headers: { Accept: "text/event-stream" },
-      body: await blobToFormData(blob, "file", "ai.mp3"),
-    });
-    const ct = (resp.headers.get("content-type") || "").toLowerCase();
-    if (!ct.includes("text/event-stream")) return false;
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let full = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      for (const line of chunk.split(/\r?\n/)) {
-        if (!line.startsWith("data:")) continue;
-        const json = line.slice(5).trim();
-        if (!json) continue;
-        try {
-          const evt = JSON.parse(json);
-          if (evt.delta) {
-            full += evt.delta;
-            if (aiBubbleEl) aiBubbleEl.textContent = full;
-          }
-          if (evt.text && evt.done) {
-            if (aiBubbleEl) aiBubbleEl.textContent = evt.text;
-            return true;
-          }
-        } catch {}
-      }
-    }
-    return !!full;
-  };
-
-  const sseOk = await trySSE().catch(() => false);
-  if (sseOk) return;
-
   try {
     const resp = await fetch(N8N_TRANSCRIBE_URL, {
       method: "POST",
       body: await blobToFormData(blob, "file", "ai.mp3"),
     });
     const data = await resp.json().catch(() => null);
-    const text = data?.text || data?.transcript || "";
+    const text =
+      data?.text ||
+      data?.transcript ||
+      data?.message ||
+      "";
     if (text && aiBubbleEl) {
       await typewriter(aiBubbleEl, text, 18);
     }
-  } catch {}
+  } catch (err) {
+    warn("liveTranscribeBlob failed", err);
+  }
 }
 
 async function blobToFormData(
@@ -1425,9 +1398,7 @@ async function sendChatToN8N(userText) {
     const hist = await fetchLastPairsFromSupabase(user_id, { pairs: 8 });
     historyPairsText = hist.text || "";
     historyPairs = hist.pairs || [];
-  } catch {
-    // non-fatal
-  }
+  } catch {}
   const prevSummary = await fetchRollingSummary(user_id, device);
   const rollingSummary = buildRollingSummary(
     prevSummary,
