@@ -2,64 +2,146 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Son of Wisdom — Call</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Son of Wisdom — Call</title>
   <link rel="stylesheet" href="style.css" />
 </head>
-<body class="sow-shell page-call">
 
-  <header class="appbar appbar-plain">
+<body class="sow-shell page-call">
+  <!-- App bar -->
+  <header class="appbar">
+    <!-- Simple back to main chat (fresh) -->
+    <button
+      id="btn-back-home"
+      class="icon-btn"
+      aria-label="Back to chat"
+      title="Back to chat"
+      type="button"
+    >
+      <span style="display:inline-block;font-size:22px;line-height:1;">×</span>
+    </button>
+
     <div class="powered tiny">
       powered by <span class="brand-mini">Son of Wisdom</span>
     </div>
-    <a href="home.html" class="btn small ghost">Back to chat</a>
+
+    <!-- This link will be wired by call.js once we know conversationId -->
+    <a
+      id="back-to-thread"
+      class="btn pill small"
+      href="#"
+      style="display:none;"
+    >
+      Return to conversation
+    </a>
   </header>
 
-  <main class="call-main" role="main">
+  <!-- Main content -->
+  <main class="content call-main" role="main">
     <section class="hero-mini">
-      <h1 class="hero-mini-title">Son of Wisdom</h1>
-      <p class="hero-mini-tagline">An AI Coach for the Warrior Heart.</p>
+      <h1 class="hero-mini-title">Call with AI Blake</h1>
+      <p class="hero-mini-tagline">Voice-to-voice coaching for the warrior heart.</p>
     </section>
 
-    <section class="call-card">
-      <div id="avatar-container" class="call-avatar-wrap">
-        <canvas id="voiceRing"></canvas>
-        <img src="Sonofwisdom.png" alt="Son of Wisdom" class="call-avatar-img" />
-      </div>
+    <section>
+      <div class="call-card">
+        <!-- Avatar + animated ring -->
+        <div class="call-avatar-wrap" id="avatar-container">
+          <canvas id="voiceRing"></canvas>
+          <!-- Replace src with your actual avatar asset -->
+          <img
+            src="avatar-blake.png"
+            alt="AI Blake"
+            class="call-avatar-img"
+          />
+        </div>
 
-      <p id="status-text" class="call-status">
-        Tap the blue call button to begin.
-      </p>
-      <div id="call-timer" class="call-timer">00:00</div>
+        <!-- Status + timer -->
+        <div class="call-status">
+          <span id="status-text">Tap the blue call button to begin.</span>
+        </div>
+        <div class="call-timer" id="call-timer">00:00</div>
 
-      <section id="transcript" class="call-transcript">
-        <div id="transcript-list" class="transcript-list"></div>
-        <div id="transcript-interim" class="transcript-interim"></div>
-      </section>
+        <!-- Transcript area -->
+        <div id="transcript" class="call-transcript">
+          <div id="transcript-list" class="transcript-list"></div>
+          <div id="transcript-interim" class="transcript-interim"></div>
+        </div>
 
-      <div class="call-controls">
-        <button id="mic-btn" class="btn circle ghost" aria-pressed="false" title="Mute/unmute mic">
-          🎙
-        </button>
+        <!-- Call controls -->
+        <div class="call-controls">
+          <button
+            id="call-btn"
+            class="btn circle call-toggle primary"
+            type="button"
+            aria-pressed="false"
+            aria-label="Start call"
+          >
+            📞
+          </button>
 
-        <button id="call-btn" class="btn circle primary call-toggle" title="Start / end call">
-          📞
-        </button>
+          <button
+            id="mic-btn"
+            class="btn circle"
+            type="button"
+            aria-pressed="false"
+            aria-label="Toggle microphone"
+          >
+            🎙
+          </button>
 
-        <button id="speaker-btn" class="btn circle ghost" aria-pressed="true" title="Mute/unmute speaker">
-          🔊
-        </button>
+          <button
+            id="speaker-btn"
+            class="btn circle"
+            type="button"
+            aria-pressed="true"
+            aria-label="Toggle speaker"
+          >
+            🔊
+          </button>
+        </div>
 
-        <button id="mode-btn" class="btn circle ghost" aria-pressed="false" title="Switch to chat view">
-          …
-        </button>
+        <!-- Mode toggle: Call view / Chat view on same page -->
+        <div
+          class="row"
+          style="margin-top:0.75rem;justify-content:center;gap:0.5rem;"
+        >
+          <button
+            id="mode-btn"
+            class="btn pill small"
+            type="button"
+            aria-pressed="false"
+            title="Switch between Call and Chat view"
+          >
+            Switch to Chat
+          </button>
+        </div>
+
+        <!-- Chat panel will be injected by call.js after #transcript -->
+        <!-- <div id="chat-panel">…</div> is created dynamically -->
       </div>
     </section>
-
-    <!-- Chat panel is injected after #transcript by call.js -->
   </main>
-  <!-- DEV ONLY: local keys -->
-  <script src="app/dev-local.js"></script>
+
+  <footer class="sow-footer tiny">
+    Built for sons, warriors, and kings learning to govern their homes.
+  </footer>
+
+  <!-- Scripts -->
+  <script type="module">
+    // simple back button to home, starting fresh (no specific thread)
+    const backBtn = document.getElementById("btn-back-home");
+    if (backBtn) {
+      backBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        const url = new URL("home.html", window.location.origin);
+        url.searchParams.set("new", "1");
+        url.searchParams.set("ts", Date.now().toString());
+        window.location.replace(url.toString());
+      });
+    }
+  </script>
+
   <script type="module" src="app/call.js"></script>
 </body>
 </html>
