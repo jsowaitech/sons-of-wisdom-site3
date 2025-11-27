@@ -13,7 +13,9 @@
       <span style="display:inline-block;font-size:22px;line-height:1;">×</span>
     </button>
 
-    <div class="powered tiny">powered by <span class="brand-mini">Son of Wisdom</span></div>
+    <div class="powered tiny">
+      powered by <span class="brand-mini">Son of Wisdom</span>
+    </div>
 
     <button id="btn-new" class="btn pill small">+ New Conversation</button>
   </header>
@@ -26,20 +28,13 @@
 
     <section aria-label="Conversations" style="max-width:980px;margin:0 auto;">
       <h2 class="tiny muted" style="letter-spacing:.08em;margin:12px 0 10px;">CONVERSATIONS</h2>
-      <p class="muted tiny">History UI will go here. For now, use “New Conversation”.</p>
+
+      <!-- This is where history.js will render the list -->
+      <div id="list" class="conv-list"></div>
     </section>
   </main>
 
-  <script type="module">
-    const goHomeFresh = () => {
-      const url = new URL("home.html", window.location.origin);
-      url.searchParams.set("new", "1");
-      url.searchParams.set("ts", Date.now().toString());
-      window.location.replace(url.toString());
-    };
-
-    document.getElementById("btn-new")  ?.addEventListener("click", (e) => { e.preventDefault(); goHomeFresh(); });
-    document.getElementById("btn-close")?.addEventListener("click", (e) => { e.preventDefault(); goHomeFresh(); });
-  </script>
+  <!-- Load the history controller -->
+  <script type="module" src="app/history.js"></script>
 </body>
 </html>
