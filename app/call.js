@@ -3,6 +3,9 @@
 // - Continuous VAD recording → Supabase (optional) + n8n → AI audio reply
 // - Web Speech API captions + optional Hume realtime (safely stubbed)
 // - Dynamic AI greeting audio via Netlify function + ElevenLabs
+// - Conversation threads: can title an untitled conversation from first transcript
+
+import { supabase } from "./supabase.js";
 
 /* ---------- CONFIG ---------- */
 const DEBUG = true;
@@ -42,9 +45,6 @@ const HISTORY_TIME_COL = "timestamp";
 const SUMMARY_TABLE = "history_summaries";
 const SUMMARY_MAX_CHARS = 380;
 
-// Conversations table (shared with home/history)
-const CONVERSATION_TABLE = "conversations";
-
 /* ---------- n8n webhooks ---------- */
 /** Text + voice coach logic lives here (transcript only). */
 const N8N_WEBHOOK_URL =
@@ -71,6 +71,11 @@ const isUuid = (v) =>
     v || ""
   );
 
+/* ---------- Conversation thread (from ?c=...) ---------- */
+const urlParams = new URLSearchParams(window.location.search);
+const conversationId = urlParams.get("c") || null;
+let conversationTitleLocked = false; // once we set title successfully, we stop trying
+
 function getOrCreateDeviceId() {
   let id = localStorage.getItem(DEVICE_ID_KEY);
   if (!id) {
@@ -95,13 +100,6 @@ const pickUuidForHistory = (user_id) =>
     ? user_id
     : SENTINEL_UUID;
 
-/* ---------- Conversation / thread id ---------- */
-// Shared with home.html via ?c=<conversationId>
-const callPageParams = new URLSearchParams(window.location.search);
-let conversationId = callPageParams.get("c") || null;
-let conversationTitle = null;
-let hasAppliedTitleFromCall = false;
-
 /* ---------- DOM ---------- */
 const callBtn = document.getElementById("call-btn");
 const statusText = document.getElementById("status-text");
@@ -109,13 +107,15 @@ const voiceRing = document.getElementById("voiceRing");
 const micBtn = document.getElementById("mic-btn");
 const speakerBtn = document.getElementById("speaker-btn");
 const modeBtn = document.getElementById("mode-btn");
-const threadLink = document.getElementById("thread-link");
+const threadLink =
+  document.getElementById("thread-link") ||
+  document.getElementById("btn-thread");
 
 // Transcript (call view)
 const transcriptList = document.getElementById("transcript-list");
 const transcriptInterim = document.getElementById("transcript-interim");
 
-// Chat (created lazily)
+// Chat (created lazily, but Switch-to-Chat now navigates to home.html)
 let chatPanel = document.getElementById("chat-panel");
 let chatLog;
 let chatForm;
@@ -125,7 +125,7 @@ let chatInput;
 let isCalling = false;
 let isRecording = false;
 let isPlayingAI = false;
-let inChatView = false;
+let inChatView = false; // no longer toggled by mode button, but kept for compatibility
 
 let globalStream = null;
 let mediaRecorder = null;
@@ -152,134 +152,46 @@ const log = (...a) => DEBUG && console.log("[SOW]", ...a);
 const warn = (...a) => DEBUG && console.warn("[SOW]", ...a);
 const trimText = (s, n = 360) => (s || "").trim().slice(0, n);
 
-/* ---------- Conversation helpers (titles + local history) ---------- */
-function loadLocalConvos() {
-  try {
-    const raw = localStorage.getItem("convos") || "[]";
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+/* Derive a short conversation title from first user utterance */
+function deriveTitleFromText(raw) {
+  let t = (raw || "").replace(/\s+/g, " ").trim();
+  if (!t) return null;
+
+  const max = 80;
+  if (t.length > max) {
+    let cut = t.lastIndexOf(" ", max);
+    if (cut < 30) cut = max;
+    t = t.slice(0, cut);
   }
+
+  // strip leading non-alnum, trailing punctuation
+  t = t.replace(/^[^A-Za-z0-9]+/, "").replace(/[\s\-–—_,.:;!?]+$/, "");
+  if (!t) return null;
+
+  return t.charAt(0).toUpperCase() + t.slice(1);
 }
 
-function saveLocalConvos(convos) {
+async function maybeUpdateConversationTitleFromTranscript(text) {
+  if (!conversationId || conversationTitleLocked) return;
+  const title = deriveTitleFromText(text);
+  if (!title || title.length < 4) return;
+
   try {
-    localStorage.setItem("convos", JSON.stringify(convos));
-  } catch {
-    // ignore
-  }
-}
+    const { error } = await supabase
+      .from("conversations")
+      .update({ title })
+      .eq("id", conversationId)
+      .or("title.is.null,title.eq.New Conversation");
 
-function touchLocalConversation(id, { title, updated_at } = {}) {
-  if (!id) return;
-  const convos = loadLocalConvos();
-  const now = updated_at || new Date().toISOString();
-  const idx = convos.findIndex((c) => c.id === id);
-  if (idx >= 0) {
-    if (title) convos[idx].title = title;
-    convos[idx].updated_at = now;
-  } else {
-    convos.unshift({
-      id,
-      title: title || "New Conversation",
-      updated_at: now,
-    });
-  }
-  saveLocalConvos(convos);
-}
-
-function buildTitleFromText(text) {
-  const raw = (text || "").replace(/\s+/g, " ").trim();
-  if (!raw) return "New Conversation";
-  const maxLen = 80;
-  if (raw.length <= maxLen) return raw;
-  return raw.slice(0, maxLen - 1).trimEnd() + "…";
-}
-
-function shouldUpdateConversationTitle() {
-  return (
-    !hasAppliedTitleFromCall &&
-    (!conversationTitle ||
-      conversationTitle === "New Conversation" ||
-      /^untitled/i.test(conversationTitle))
-  );
-}
-
-async function initConversationMeta() {
-  if (!HAS_SUPABASE || !conversationId) return;
-  try {
-    const url = new URL(
-      `${SUPABASE_REST}/${encodeURIComponent(CONVERSATION_TABLE)}`
-    );
-    url.searchParams.set("select", "id,title,updated_at");
-    url.searchParams.set("id", `eq.${conversationId}`);
-    url.searchParams.set("limit", "1");
-    const resp = await fetch(url.toString(), {
-      headers: {
-        apikey: SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    });
-    if (!resp.ok) return;
-    const rows = await resp.json();
-    if (rows && rows[0]) {
-      conversationTitle = rows[0].title || "New Conversation";
-      const updated = rows[0].updated_at || new Date().toISOString();
-      touchLocalConversation(conversationId, {
-        title: conversationTitle,
-        updated_at: updated,
-      });
+    if (error) {
+      warn("Conversation title update error:", error);
+      return;
     }
+    conversationTitleLocked = true;
+    log("[SOW] Conversation title set from call transcript:", title);
   } catch (e) {
-    warn("initConversationMeta failed", e);
+    warn("Conversation title update failed:", e);
   }
-}
-
-async function updateConversationMetadataFromTranscript(text) {
-  if (!conversationId) return;
-  const raw = (text || "").replace(/\s+/g, " ").trim();
-  if (!raw) return;
-
-  const nowIso = new Date().toISOString();
-  const newTitle = buildTitleFromText(raw);
-  const updateTitle = shouldUpdateConversationTitle();
-
-  if (HAS_SUPABASE) {
-    try {
-      const body = [
-        {
-          id: conversationId,
-          updated_at: nowIso,
-          ...(updateTitle ? { title: newTitle } : {}),
-        },
-      ];
-      await fetch(
-        `${SUPABASE_REST}/${encodeURIComponent(CONVERSATION_TABLE)}`,
-        {
-          method: "POST",
-          headers: {
-            apikey: SUPABASE_SERVICE_ROLE_KEY,
-            Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-            "Content-Type": "application/json",
-            Prefer: "resolution=merge-duplicates",
-          },
-          body: JSON.stringify(body),
-        }
-      );
-    } catch (e) {
-      warn("updateConversationMetadataFromTranscript failed", e);
-    }
-  }
-
-  if (updateTitle) {
-    conversationTitle = newTitle;
-    hasAppliedTitleFromCall = true;
-  }
-  touchLocalConversation(conversationId, {
-    title: conversationTitle || newTitle,
-    updated_at: nowIso,
-  });
 }
 
 /* ---------- History / Summary (Supabase via REST, optional) ---------- */
@@ -418,7 +330,7 @@ function buildRollingSummary(
   return summary.length ? summary : sentences.join(" ").slice(-maxChars);
 }
 
-/* ---------- UI: Chat ---------- */
+/* ---------- UI: Chat (still wired for n8n, but Switch-to-Chat now navigates) ---------- */
 function ensureChatUI() {
   if (!chatPanel) {
     chatPanel = document.createElement("div");
@@ -447,7 +359,6 @@ function ensureChatUI() {
       const txt = (chatInput?.value || "").trim();
       if (!txt) return;
       chatInput.value = "";
-      showChatView();
       appendMsg("me", txt);
       await sendChatToN8N(txt);
     });
@@ -770,9 +681,18 @@ function updateMicUI() {
 
 function updateModeBtnUI() {
   if (modeBtn) {
-    modeBtn.setAttribute("aria-pressed", String(inChatView));
-    modeBtn.title = inChatView ? "Switch to Call view" : "Switch to Chat view";
+    modeBtn.setAttribute("aria-pressed", "false");
+    modeBtn.title = "Open this conversation in chat view";
   }
+}
+
+/* ---------- Navigation back to chat thread ---------- */
+function navigateToChatThread() {
+  const params = new URLSearchParams(window.location.search);
+  const c = params.get("c");
+  const url = new URL("home.html", window.location.origin);
+  if (c) url.searchParams.set("c", c);
+  window.location.href = url.toString();
 }
 
 /* ---------- Controls ---------- */
@@ -806,13 +726,22 @@ speakerBtn?.addEventListener("click", async () => {
   }
 });
 
-modeBtn?.addEventListener("click", () => {
-  inChatView ? showCallView() : showChatView();
+// Switch-to-Chat button now navigates back to home.html?c=...
+modeBtn?.addEventListener("click", (e) => {
+  e.preventDefault();
+  navigateToChatThread();
+});
+
+// Optional thread link in the footer
+threadLink?.addEventListener("click", (e) => {
+  e.preventDefault();
+  navigateToChatThread();
 });
 
 document.addEventListener("keydown", (e) => {
   if (e.key?.toLowerCase?.() === "c") {
-    inChatView ? showCallView() : showChatView();
+    e.preventDefault();
+    navigateToChatThread();
   }
 });
 
@@ -1331,11 +1260,8 @@ async function uploadRecordingAndNotify() {
     if (recentUserTurns.length > RECENT_USER_KEEP) {
       recentUserTurns.splice(0, recentUserTurns.length - RECENT_USER_KEEP);
     }
-  }
-
-  // Update conversation title/updated_at from first voice transcript
-  if (combinedTranscript) {
-    updateConversationMetadataFromTranscript(combinedTranscript).catch(() => {});
+    // Title the conversation on first meaningful utterance if still untitled
+    maybeUpdateConversationTitleFromTranscript(combinedTranscript).catch(() => {});
   }
 
   const user_id = getUserIdForWebhook();
@@ -1581,10 +1507,8 @@ async function sendChatToN8N(userText) {
     recentUserTurns.splice(0, recentUserTurns.length - RECENT_USER_KEEP);
   }
 
-  // Update conversation title/updated_at from first call-page chat message
-  if (userText) {
-    updateConversationMetadataFromTranscript(userText).catch(() => {});
-  }
+  // Also allow chat text from call page to title an untitled conversation
+  maybeUpdateConversationTitleFromTranscript(userText).catch(() => {});
 
   let historyPairsText = "";
   let historyPairs = [];
@@ -1596,11 +1520,7 @@ async function sendChatToN8N(userText) {
     // ignore
   }
   const prevSummary = await fetchRollingSummary(user_id, device);
-  const rollingSummary = buildRollingSummary(
-    prevSummary,
-    historyPairs,
-    userText
-  );
+  const rollingSummary = buildRollingSummary(prevSummary, historyPairs, userText);
   const transcriptForModel = historyPairsText
     ? `Previous conversation (last ${Math.min(
         historyPairs.length,
@@ -1775,20 +1695,10 @@ async function playStreamedWebmOpus(response) {
   }
 }
 
-/* ---------- Thread link wiring ---------- */
-function setupThreadLink() {
-  if (!threadLink) return;
-  const url = new URL("home.html", window.location.origin);
-  if (conversationId) url.searchParams.set("c", conversationId);
-  threadLink.href = url.toString();
-}
-
 /* ---------- Boot ---------- */
 updateMicUI();
 updateSpeakerUI();
 updateModeBtnUI();
 showCallView();
-setupThreadLink();
-initConversationMeta(); // fire-and-forget: gets current title if any
 prepareGreetingForNextCall();
 log("[SOW] call.js ready");
