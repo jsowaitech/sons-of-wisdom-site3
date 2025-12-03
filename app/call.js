@@ -53,7 +53,7 @@ const N8N_WEBHOOK_URL =
 /* Optional: AI-transcript webhook (leave empty to disable) */
 const N8N_TRANSCRIBE_URL = "";
 
-/** NEW: Local hard-coded replacement for n8n voice workflow */
+/** Local hard-coded replacement for n8n voice workflow */
 const CALL_COACH_ENDPOINT = "/.netlify/functions/call-coach";
 
 /* ---------- Netlify / ElevenLabs greeting ---------- */
@@ -69,7 +69,7 @@ const USER_ID_KEY = "sow_user_id";
 const DEVICE_ID_KEY = "sow_device_id";
 const SENTINEL_UUID = "00000000-0000-0000-0000-000000000000";
 
-/** NEW: the current call session id (used for transcript mode) */
+/** the current call session id (used for transcript mode) */
 let currentCallId = null;
 
 const isUuid = (v) =>
@@ -794,7 +794,7 @@ async function startCall() {
   if (isCalling) return;
   isCalling = true;
 
-  // NEW: create a call_id for this session and store it
+  // create a call_id for this session and store it
   try {
     currentCallId = crypto.randomUUID();
   } catch {
@@ -1288,7 +1288,7 @@ async function uploadRecordingAndNotify() {
   const user_id = getUserIdForWebhook();
   const device = getOrCreateDeviceId();
 
-  // NEW: ensure we always have a call_id and keep it persisted
+  // ensure we always have a call_id and keep it persisted
   if (!currentCallId) {
     try {
       currentCallId =
@@ -1333,7 +1333,7 @@ async function uploadRecordingAndNotify() {
       )} pairs), oldest→newest:\n${historyPairsText}\n\nUser now says:\n${combinedTranscript}`
     : combinedTranscript;
 
-  // upload to storage (OPTIONAL)
+  // upload user audio to storage (OPTIONAL)
   let uploaded = false;
   if (HAS_SUPABASE) {
     try {
@@ -1371,7 +1371,9 @@ async function uploadRecordingAndNotify() {
     const body = {
       user_id,
       device_id: device,
-      call_id: currentCallId, // NEW: attach call_id so transcript mode can follow
+      call_id: currentCallId,
+      // NEW: pass the current utterance separately so backend can log it cleanly
+      user_turn: combinedTranscript,
       transcript: transcriptForModel,
       has_transcript: !!transcriptForModel,
       history_user_last3: recentUserTurns.slice(-3),
@@ -1389,7 +1391,7 @@ async function uploadRecordingAndNotify() {
 
     const ct = (resp.headers.get("content-type") || "").toLowerCase();
 
-    // progressive stream first (kept for compatibility; call-coach currently returns JSON)
+    // progressive stream first (kept for compatibility; call-coach currently returns JSON or audio)
     if (
       ENABLE_STREAMED_PLAYBACK &&
       ct.includes("audio/webm") &&
@@ -1435,7 +1437,7 @@ async function uploadRecordingAndNotify() {
       }
     }
   } catch (e) {
-    warn("webhook failed", e);
+    warn("call-coach failed", e);
     statusText.textContent = "AI processing failed.";
     return false;
   }

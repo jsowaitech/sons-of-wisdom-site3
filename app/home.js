@@ -138,7 +138,7 @@ In EVERY response:
 - Do NOT use bullet lists or markdown lists.
   - Do not start lines with dashes or stars.
   - Do not write numbered lists like “1.” on separate lines.
-- Do NOT write visible escape sequences like "\n" or "\t".
+- Do NOT write visible escape sequences like "\\n" or "\\t".
 - Do NOT wrap the entire answer in quotation marks.
 - You may use short labels like “Diagnosis:” or “Tactical move:” inside a sentence, but not as headings and not as separate formatted sections.
 - Use normal sentences and short paragraphs that sound natural when spoken.
@@ -310,7 +310,8 @@ In every answer you:
 - First ask questions to understand his reality and his heart.
 - Then, when ready, give short, clear, practical guidance that helps him govern his emotions, his marriage, his children, and the atmosphere of his home as a Son of Wisdom.
 
-All of this must be delivered in TTS-safe plain text, without markdown symbols, lists, headings, or escape sequences in your responses.`.trim();
+All of this must be delivered in TTS-safe plain text, without markdown symbols, lists, headings, or escape sequences in your responses.
+`.trim();
 
 /* ------------------------------ state -------------------------------- */
 let session = null;
@@ -371,6 +372,38 @@ function appendBubble(role, text) {
   ensureChatScroll();
 }
 
+/* -------- NEW: load previous messages for this conversation --------- */
+async function loadConversationHistory(convId) {
+  if (!convId || !refs.chatBox) return;
+  try {
+    setStatus("Loading conversation…");
+
+    const { data, error } = await supabase
+      .from("conversation_messages")
+      .select("role, content, created_at")
+      .eq("conversation_id", convId)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      console.error("[HOME] loadConversationHistory error:", error);
+      setStatus("Could not load previous messages.", true);
+      return;
+    }
+
+    refs.chatBox.innerHTML = "";
+
+    (data || []).forEach((row) => {
+      const bubbleRole = row.role === "assistant" ? "ai" : "user";
+      appendBubble(bubbleRole, row.content || "");
+    });
+
+    // status will be overwritten by boot()'s final setStatus
+  } catch (err) {
+    console.error("[HOME] loadConversationHistory failed:", err);
+    setStatus("Could not load previous messages.", true);
+  }
+}
+
 /* ---------------------------- networking ------------------------------ */
 // Single entry point used by handleSend()
 async function chatRequest(text, meta = {}) {
@@ -391,7 +424,7 @@ async function chatRequest(text, meta = {}) {
   }
   const data = await res.json().catch(() => ({}));
   // server returns: { reply, conversationId, summary, audio_base64?, audio_mime? }
-  return data.reply ?? data.message ?? "";
+  return data.reply ?? data.message ?? data.text ?? "";
 }
 
 /* ---- DEV ONLY: direct browser call to OpenAI (no server) ---- */
@@ -649,6 +682,8 @@ async function ensureConversationForUser(user) {
 
   try {
     conversationId = await ensureConversationForUser(session.user);
+    // NEW: load any existing messages for this conversation
+    await loadConversationHistory(conversationId);
   } catch (e) {
     console.error("[HOME] conversation init error:", e);
     setStatus("Could not create conversation. Please refresh.", true);
