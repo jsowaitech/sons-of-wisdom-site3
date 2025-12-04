@@ -1,13 +1,24 @@
 // app/auth.js
-// ------------------------------------------------------------
-// Authentication logic for Son of Wisdom (single-page):
+// Single-page auth flow for Son of Wisdom
 // - Sign in
-// - Guided sign up via email link
+// - Sign up via email link
 // - Password set/reset after email link
-// ------------------------------------------------------------
-import { supabase } from '/app/supabase.js';
+
+import { supabase } from './supabase.js';
 
 const $ = (sel) => document.querySelector(sel);
+
+// ---- Config: where should Supabase send people back? ----
+// When you're on HTTP(S), we just use window.location.origin.
+// When you're running from file://, fall back to your dev server.
+// Adjust this fallback if your dev port is different.
+const DEV_FALLBACK_ORIGIN = 'http://127.0.0.1:5500';
+
+function getAuthOrigin() {
+  const origin = window.location.origin;
+  if (origin && origin.startsWith('http')) return origin;
+  return DEV_FALLBACK_ORIGIN;
+}
 
 // Shared DOM
 const statusEl    = $('#status');
@@ -17,7 +28,7 @@ const viewSignin  = $('#view-signin');
 const viewSignup  = $('#view-signup-email');
 const viewSetPw   = $('#view-set-password');
 
-// Sign-in view elements
+// Sign-in view
 const signinEmailEl = $('#signin-email');
 const signinPassEl  = $('#signin-password');
 const btnSignIn     = $('#btn-signin');
@@ -25,12 +36,12 @@ const linkSignup    = $('#link-signup');
 const linkForgot    = $('#link-forgot');
 const togglePassword = document.getElementById('toggle-password');
 
-// Sign-up (email) view elements
+// Sign-up email view
 const signupEmailEl   = $('#signup-email');
 const btnSignupEmail  = $('#btn-signup-email');
 const linkBackSignin  = $('#link-back-signin');
 
-// Set-password view elements
+// Set-password view
 const setpwEmailLine   = $('#setpw-email-line');
 const setpwEmailSpan   = $('#user-email');
 const setpwForm        = $('#set-password-form');
@@ -39,7 +50,7 @@ const setpwPassConfEl  = $('#sp-password-confirm');
 const btnSetPassword   = $('#btn-set-password');
 const setpwSigninLink  = $('#setpw-signin-link');
 
-// -------- Helpers --------
+// ---------- helpers ----------
 function setStatus(message, kind = 'info') {
   if (!statusEl) return;
   statusEl.textContent = message || '';
@@ -50,18 +61,7 @@ function setStatus(message, kind = 'info') {
 function getRedirectTarget() {
   const params = new URLSearchParams(window.location.search);
   const redirect = params.get('redirect');
-  if (redirect) return redirect;
-  return '/home.html';
-}
-
-function updateUrlMode(mode) {
-  const url = new URL(window.location.href);
-  if (!mode || mode === 'signin') {
-    url.searchParams.delete('mode');
-  } else {
-    url.searchParams.set('mode', mode);
-  }
-  window.history.replaceState({}, '', url.toString());
+  return redirect || 'home.html';
 }
 
 function showView(mode) {
@@ -78,7 +78,6 @@ function showView(mode) {
     subEl.textContent =
       'Step 1: enter the email where you want your Son of Wisdom account.';
   } else if (mode === 'set-password') {
-    // Copy is further refined by set-password init based on ?from param
     titleEl.textContent = 'Set your password';
     subEl.textContent =
       'Your email link is confirmed. Choose a password for your account.';
@@ -87,13 +86,12 @@ function showView(mode) {
     subEl.textContent = 'Sign in to continue where you left off.';
   }
 
-  // Clear status whenever switching modes (set-password init may overwrite)
   if (mode !== 'set-password') {
     setStatus('');
   }
 }
 
-// -------- Bootstrap from URL params --------
+// ---------- bootstrap from URL ----------
 const params = new URLSearchParams(window.location.search);
 let mode = params.get('mode') || 'signin';
 if (!['signin', 'signup', 'set-password'].includes(mode)) {
@@ -116,10 +114,9 @@ if (!['signin', 'signup', 'set-password'].includes(mode)) {
   }
 })();
 
-// Initial view
 showView(mode);
 
-// -------- Sign in --------
+// ---------- sign in ----------
 async function handleSignIn() {
   const email = (signinEmailEl?.value || '').trim();
   const password = (signinPassEl?.value || '').trim();
@@ -173,29 +170,26 @@ signinPassEl?.addEventListener('keydown', (e) => {
   }
 });
 
-// -------- Create account (sign-up email step) --------
+// ---------- switch to signup view ----------
 linkSignup?.addEventListener('click', (e) => {
   e.preventDefault();
-  // Prefill signup email from signin field if present
   const existing = (signinEmailEl?.value || '').trim();
   if (existing && signupEmailEl && !signupEmailEl.value) {
     signupEmailEl.value = existing;
   }
   mode = 'signup';
   showView(mode);
-  updateUrlMode(mode);
 });
 
 linkBackSignin?.addEventListener('click', (e) => {
   e.preventDefault();
-  // Copy email back for convenience
   const email = (signupEmailEl?.value || '').trim();
   if (email && signinEmailEl) signinEmailEl.value = email;
   mode = 'signin';
   showView(mode);
-  updateUrlMode(mode);
 });
 
+// ---------- sign up: send confirmation email ----------
 btnSignupEmail?.addEventListener('click', async () => {
   const email = (signupEmailEl?.value || '').trim();
   if (!email) {
@@ -208,7 +202,8 @@ btnSignupEmail?.addEventListener('click', async () => {
   setStatus('Sending confirmation link…', 'info');
 
   try {
-    const redirectUrl = new URL('/auth.html', window.location.origin);
+    const origin = getAuthOrigin();
+    const redirectUrl = new URL('auth.html', origin);
     redirectUrl.searchParams.set('mode', 'set-password');
     redirectUrl.searchParams.set('from', 'signup');
 
@@ -238,7 +233,7 @@ btnSignupEmail?.addEventListener('click', async () => {
   }
 });
 
-// -------- Forgot password (send recovery email) --------
+// ---------- forgot password: send reset email ----------
 linkForgot?.addEventListener('click', async (e) => {
   e.preventDefault();
   const email = (signinEmailEl?.value || '').trim();
@@ -254,7 +249,8 @@ linkForgot?.addEventListener('click', async (e) => {
   setStatus('Sending password reset link…', 'info');
 
   try {
-    const redirectUrl = new URL('/auth.html', window.location.origin);
+    const origin = getAuthOrigin();
+    const redirectUrl = new URL('auth.html', origin);
     redirectUrl.searchParams.set('mode', 'set-password');
     redirectUrl.searchParams.set('from', 'recovery');
 
@@ -281,7 +277,7 @@ linkForgot?.addEventListener('click', async (e) => {
   }
 });
 
-// -------- Set-password view (after email link) --------
+// ---------- set-password view ----------
 function setCopyFromContext() {
   const from = params.get('from') || 'signup';
   if (!titleEl || !subEl) return;
@@ -373,7 +369,8 @@ setpwForm?.addEventListener('submit', async (e) => {
 
     await supabase.auth.signOut();
 
-    const dest = new URL('/auth.html', window.location.origin);
+    const origin = getAuthOrigin();
+    const dest = new URL('auth.html', origin);
     dest.searchParams.set('mode', 'signin');
     if (email) dest.searchParams.set('email', email);
     dest.searchParams.set('password_set', '1');
@@ -385,13 +382,13 @@ setpwForm?.addEventListener('submit', async (e) => {
   }
 });
 
-// Initialize set-password mode (if applicable)
+// init if we arrived via email link
 initSetPasswordIfNeeded().catch((err) => {
   console.error('[auth] init set-password error', err);
   setStatus('Something went wrong loading this page.', 'error');
 });
 
-// -------- Toggle password visibility on sign-in field --------
+// ---------- toggle password visibility on sign-in ----------
 togglePassword?.addEventListener('click', () => {
   if (!signinPassEl) return;
   const isHidden = signinPassEl.type === 'password';
@@ -399,5 +396,4 @@ togglePassword?.addEventListener('click', () => {
   togglePassword.textContent = isHidden ? '🙈' : '👁️';
 });
 
-// -------- Ready --------
 console.log('[auth] ready');

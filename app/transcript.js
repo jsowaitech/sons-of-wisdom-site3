@@ -2,9 +2,11 @@
 // Live transcription viewer for Son of Wisdom calls.
 // - Reads call_sessions from Supabase for a given call_id
 // - Renders separate bubbles for user + AI
-// - Streams new inserts via Realtime
+// - Streams new inserts via Realtime (standalone mode)
 // - When embedded (?embed=1), hides call-id footer controls
 //   and tweaks layout so it fits inside the call page panel.
+// - NEW: when embedded, also accepts live postMessage events
+//   from call.js for real-time user + AI captions.
 
 import { supabase } from "./supabase.js";
 
@@ -29,6 +31,9 @@ let currentCallId = "";
 let realtimeChannel = null;
 const cache = []; // { role, text, ts }
 
+/** Interim live bubble coming from call.js postMessage */
+let liveInterimEl = null;
+
 // ---------- Helpers ----------
 
 function fmtTime(input) {
@@ -52,6 +57,11 @@ function setLive(isLive) {
 function clearUI() {
   if (els.list) els.list.innerHTML = "";
   cache.length = 0;
+  // also clear any interim bubble
+  if (liveInterimEl && liveInterimEl.parentNode) {
+    liveInterimEl.parentNode.removeChild(liveInterimEl);
+  }
+  liveInterimEl = null;
 }
 
 function updateAutoScrollUI() {
@@ -147,6 +157,59 @@ function handleRow(row, { animate = false } = {}) {
   }
 }
 
+/** NEW: show interim text from live call.js events */
+function setLiveInterim(text, role = "user") {
+  const trimmed = (text || "").trim();
+  if (!els.list) return;
+
+  if (!trimmed) {
+    // clear interim
+    if (liveInterimEl && liveInterimEl.parentNode) {
+      liveInterimEl.parentNode.removeChild(liveInterimEl);
+    }
+    liveInterimEl = null;
+    return;
+  }
+
+  if (!liveInterimEl) {
+    const article = document.createElement("article");
+    article.className = `turn ${role} interim`;
+
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+
+    const whoSpan = document.createElement("span");
+    whoSpan.className = "role";
+    whoSpan.textContent = role === "assistant" ? "Blake" : "You";
+
+    const timeSpan = document.createElement("span");
+    timeSpan.className = "time";
+    timeSpan.textContent = fmtTime(new Date());
+
+    meta.appendChild(whoSpan);
+    meta.appendChild(timeSpan);
+
+    const textEl = document.createElement("div");
+    textEl.className = "text";
+    textEl.textContent = trimmed;
+
+    bubble.appendChild(meta);
+    bubble.appendChild(textEl);
+    article.appendChild(bubble);
+    els.list.appendChild(article);
+
+    liveInterimEl = article;
+  } else {
+    const textEl = liveInterimEl.querySelector(".text");
+    if (textEl) textEl.textContent = trimmed;
+  }
+
+  if (autoScrollEnabled) scrollToBottom();
+}
+
 // ---------- Data: initial load + realtime ----------
 
 async function loadInitial(callId) {
@@ -184,6 +247,13 @@ function subscribeRealtime(callId) {
 
   if (!callId) {
     setLive(false);
+    return;
+  }
+
+  // NEW: when embedded inside call.html, live updates come from call.js
+  // via postMessage, so we *don't* need Supabase realtime here.
+  if (isEmbed) {
+    setLive(true);
     return;
   }
 
@@ -298,6 +368,40 @@ if (els.closeBtn) {
   });
 }
 
+// ---------- NEW: live events from call.js when embedded ----------
+
+window.addEventListener("message", (event) => {
+  const data = event.data || {};
+  // Only handle messages coming from our call page
+  if (data.source && data.source !== "sow-call") return;
+
+  const type = data.type;
+  const text = data.text || "";
+  const speaker = data.speaker === "assistant" ? "assistant" : "user";
+
+  if (!type) return;
+
+  // As soon as we receive something from call.js, mark LIVE.
+  if (isEmbed) setLive(true);
+
+  switch (type) {
+    case "clear":
+      clearUI();
+      break;
+    case "interim":
+      setLiveInterim(text, speaker);
+      break;
+    case "final":
+    case "ai_final":
+      // Promote interim to final turn
+      setLiveInterim("", speaker);
+      appendTurn(speaker, text, new Date(), { animate: false });
+      break;
+    default:
+      break;
+  }
+});
+
 // ---------- Boot ----------
 
 if (isEmbed) {
@@ -319,3 +423,5 @@ if (startId) {
   clearUI();
   setLive(false);
 }
+
+console.log("[SOW] transcript.js ready");

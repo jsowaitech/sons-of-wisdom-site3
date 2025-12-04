@@ -122,6 +122,10 @@ const threadLink =
 const transcriptList = document.getElementById("transcript-list");
 const transcriptInterim = document.getElementById("transcript-interim");
 
+/* 🔵 Live transcript panel iframe (right-hand side) */
+const transcriptFrame =
+  document.querySelector(".call-side-transcript iframe") || null;
+
 // Chat (created lazily, but Switch-to-Chat now navigates to home.html)
 let chatPanel = document.getElementById("chat-panel");
 let chatLog;
@@ -199,6 +203,30 @@ function startCallTimer() {
   callStartedAt = Date.now();
   updateCallTimer();
   callTimerInterval = setInterval(updateCallTimer, 1000);
+}
+
+/* 🔵 Bridge helper: send events to the live transcript iframe */
+function postToTranscriptPanel(payload) {
+  if (!transcriptFrame || !transcriptFrame.contentWindow) return;
+  try {
+    transcriptFrame.contentWindow.postMessage(
+      { source: "sow-call", ...payload },
+      "*" // use * so it also works on file:// during local dev
+    );
+  } catch (e) {
+    warn("postToTranscriptPanel error", e);
+  }
+}
+
+/* Helper to send assistant text as a final turn */
+function sendAssistantTextToTranscript(text) {
+  const s = (text || "").trim();
+  if (!s) return;
+  postToTranscriptPanel({
+    type: "final",
+    text: s,
+    speaker: "assistant",
+  });
 }
 
 /* Derive a short conversation title from first user utterance */
@@ -463,9 +491,18 @@ const transcriptUI = {
     transcriptInterim.textContent = "";
     transcriptList.innerHTML = "";
     lastFinalLine = "";
+    // also clear the right-hand panel
+    postToTranscriptPanel({ type: "clear" });
   },
   setInterim(t) {
-    transcriptInterim.textContent = t || "";
+    const text = t || "";
+    transcriptInterim.textContent = text;
+    if (!text) return;
+    postToTranscriptPanel({
+      type: "interim",
+      text,
+      speaker: "user",
+    });
   },
   addFinalLine(t) {
     const s = (t || "").trim();
@@ -476,6 +513,11 @@ const transcriptUI = {
     div.textContent = s;
     transcriptList.appendChild(div);
     transcriptList.scrollTop = transcriptList.scrollHeight;
+    postToTranscriptPanel({
+      type: "final",
+      text: s,
+      speaker: "user",
+    });
   },
 };
 
@@ -1273,7 +1315,8 @@ async function playAIWithBargeIn(
     animateRingFromElement(a, "#d4a373");
 
     // live transcription webhook if configured
-    if (!aiBubbleEl && inChatView) aiBubbleEl = appendMsg("ai", "", { typing: true });
+    if (!aiBubbleEl && inChatView)
+      aiBubbleEl = appendMsg("ai", "", { typing: true });
     if (aiBlob && N8N_TRANSCRIBE_URL) {
       try {
         liveTranscribeBlob(aiBlob, aiBubbleEl).catch(() => {});
@@ -1330,7 +1373,9 @@ async function uploadRecordingAndNotify() {
       recentUserTurns.splice(0, recentUserTurns.length - RECENT_USER_KEEP);
     }
     // Title the conversation on first meaningful utterance if still untitled
-    maybeUpdateConversationTitleFromTranscript(combinedTranscript).catch(() => {});
+    maybeUpdateConversationTitleFromTranscript(combinedTranscript).catch(
+      () => {}
+    );
   }
 
   const user_id = getUserIdForWebhook();
@@ -1515,6 +1560,12 @@ async function uploadRecordingAndNotify() {
     }
   }
 
+  // If we had AI text in JSON *and* we're not using N8N streaming,
+  // mirror it into the live transcript panel.
+  if (aiTextFromJSON && !N8N_TRANSCRIBE_URL) {
+    sendAssistantTextToTranscript(aiTextFromJSON);
+  }
+
   upsertRollingSummary(user_id, device, rollingSummary).catch(() => {});
   return !interrupted || true;
 }
@@ -1547,15 +1598,25 @@ async function liveTranscribeBlob(blob, aiBubbleEl) {
           if (evt.delta) {
             full += evt.delta;
             if (aiBubbleEl) aiBubbleEl.textContent = full;
+            // send as assistant interim text
+            postToTranscriptPanel({
+              type: "interim",
+              text: full,
+              speaker: "assistant",
+            });
           }
           if (evt.text && evt.done) {
             if (aiBubbleEl) aiBubbleEl.textContent = evt.text;
+            sendAssistantTextToTranscript(evt.text);
             return true;
           }
         } catch (e) {
           // ignore
         }
       }
+    }
+    if (full) {
+      sendAssistantTextToTranscript(full);
     }
     return !!full;
   };
@@ -1573,6 +1634,7 @@ async function liveTranscribeBlob(blob, aiBubbleEl) {
     if (text && aiBubbleEl) {
       await typewriter(aiBubbleEl, text, 18);
     }
+    if (text) sendAssistantTextToTranscript(text);
   } catch (e) {
     // ignore
   }
@@ -1607,7 +1669,11 @@ async function sendChatToN8N(userText) {
     // ignore
   }
   const prevSummary = await fetchRollingSummary(user_id, device);
-  const rollingSummary = buildRollingSummary(prevSummary, historyPairs, userText);
+  const rollingSummary = buildRollingSummary(
+    prevSummary,
+    historyPairs,
+    userText
+  );
   const transcriptForModel = historyPairsText
     ? `Previous conversation (last ${Math.min(
         historyPairs.length,

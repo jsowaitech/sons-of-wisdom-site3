@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Sign in — Son of Wisdom</title>
-  <!-- 🔁 changed from /style.css to style.css -->
+  <!-- relative path so it works in local file + dev server -->
   <link rel="stylesheet" href="style.css" />
 </head>
 <body class="sow-shell">
@@ -13,7 +13,6 @@
   <header class="sow-hero" aria-label="Son of Wisdom">
     <div class="sow-hero-logo-ring">
       <div class="sow-hero-logo-inner">
-        <!-- 🔁 changed from /Sonofwisdom.png to Sonofwisdom.png -->
         <img src="Sonofwisdom.png" alt="Son of Wisdom logo" class="sow-hero-logo-img" />
       </div>
     </div>
@@ -157,7 +156,7 @@
           style="margin-top:0.6rem; display:none;"
         >
           You can now
-          <a class="auth-link" href="/auth.html">sign in</a>
+          <a class="auth-link" href="auth.html">sign in</a>
           with your new password.
         </p>
       </div>
@@ -177,6 +176,7 @@
     powered by <span class="brand-mini">Son of Wisdom</span>
   </footer>
 
-  <script type="module" src="/app/auth.js"></script>
+  <!-- relative path so it works from the same folder -->
+  <script type="module" src="app/auth.js"></script>
 </body>
 </html>
