@@ -1,8 +1,6 @@
-// supabase.js
+// app/supabase.js
 import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm";
 
-// --- Configure ---
-// Prefer window overrides (e.g., set in HTML before module scripts), otherwise fall back to hard-coded defaults.
 const SUPABASE_URL =
   window.SUPABASE_URL || "https://utqtqqvaboeibnyjgbtk.supabase.co";
 
@@ -10,9 +8,6 @@ const SUPABASE_ANON_KEY =
   window.SUPABASE_ANON_KEY ||
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0cXRxcXZhYm9laWJueWpnYnRrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTUwNzg4ODUsImV4cCI6MjA3MDY1NDg4NX0.GShilY2N0FHlIl5uohZzH5UjSItDGpbQjVDltQi5kbQ";
 
-// --- Client ---
-// Keep auth session in localStorage so you stay signed in across refreshes.
-// PKCE flow is the recommended default for browser-based apps.
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
     persistSession: true,
@@ -21,8 +16,6 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     flowType: "pkce",
   },
 });
-
-// --- Helpers (expected by home.js and other pages) ---
 
 export async function getSession() {
   const { data, error } = await supabase.auth.getSession();
