@@ -160,6 +160,8 @@ let speakerMuted = false;
 /* Greeting prefetch state */
 let greetingReadyPromise = null;
 let greetingAudioUrl = null;
+// store greeting text for transcript
+let greetingTextCached = "";
 
 /* ---------- Helpers ---------- */
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -227,54 +229,6 @@ function sendAssistantTextToTranscript(text) {
     text: s,
     speaker: "assistant",
   });
-}
-
-/* 🔵 NEW: live-ish streaming of assistant text while audio plays */
-let aiTextStream = null;
-
-function streamAssistantTextLive(text) {
-  const clean = (text || "").trim();
-  if (!clean) return { stop() {} };
-
-  const words = clean.split(/\s+/).filter(Boolean);
-  if (!words.length) return { stop() {} };
-
-  // approximate speech rate ~160 wpm
-  const wps = 2.7;
-  const totalSec = Math.max(2, words.length / wps);
-  const intervalMs = Math.max(
-    45,
-    Math.floor((totalSec * 1000) / Math.max(words.length, 1))
-  );
-
-  let idx = 0;
-  let stopped = false;
-  let lastSent = "";
-
-  const timer = setInterval(() => {
-    if (stopped) return;
-    idx = Math.min(idx + 1, words.length);
-    const partial = words.slice(0, idx).join(" ");
-    if (partial !== lastSent) {
-      lastSent = partial;
-      postToTranscriptPanel({
-        type: "interim",
-        text: partial,
-        speaker: "assistant",
-      });
-    }
-    if (idx >= words.length) {
-      clearInterval(timer);
-      sendAssistantTextToTranscript(clean);
-    }
-  }, intervalMs);
-
-  return {
-    stop() {
-      stopped = true;
-      clearInterval(timer);
-    },
-  };
 }
 
 /* Derive a short conversation title from first user utterance */
@@ -884,39 +838,56 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-/* ---------- Greeting prefetch ---------- */
+/* ---------- Greeting prefetch (JSON; always transcribable) ---------- */
 async function prepareGreetingForNextCall() {
   greetingReadyPromise = (async () => {
     try {
       const user_id = getUserIdForWebhook();
       const device = getOrCreateDeviceId();
-      const payload = {
-        user_id,
-        device_id: device,
-      };
 
       const resp = await fetch(GREETING_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ user_id, device_id: device }),
       });
 
       if (!resp.ok) throw new Error(`Greeting HTTP ${resp.status}`);
-      const blob = await resp.blob();
-      if (!blob.size) throw new Error("Empty greeting audio blob");
-      if (greetingAudioUrl) {
-        try {
-          URL.revokeObjectURL(greetingAudioUrl);
-        } catch (e) {
-          // ignore
-        }
+
+      const ct = (resp.headers.get("content-type") || "").toLowerCase();
+      if (!ct.includes("application/json")) {
+        throw new Error(`Greeting unexpected content-type: ${ct || "unknown"}`);
       }
-      greetingAudioUrl = URL.createObjectURL(blob);
-      log("[SOW] Greeting audio prefetched.");
+
+      const data = await resp.json().catch(() => null);
+      const text = (data?.text || "").toString().trim();
+
+      greetingTextCached = text || "";
+
+      // audio optional; if missing, we'll play blake.mp3 but still transcribe greetingTextCached
+      const b64 = data?.audio_base64;
+      if (b64) {
+        const raw = b64.includes(",") ? b64.split(",").pop() : b64;
+        const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
+        const blob = new Blob([bytes], { type: data?.mime || "audio/mpeg" });
+
+        if (greetingAudioUrl) {
+          try {
+            URL.revokeObjectURL(greetingAudioUrl);
+          } catch (e) {
+            // ignore
+          }
+        }
+        greetingAudioUrl = URL.createObjectURL(blob);
+      } else {
+        greetingAudioUrl = null;
+      }
+
+      log("[SOW] Greeting prefetched (json).");
       return true;
     } catch (e) {
       warn("Greeting prefetch failed", e);
       greetingAudioUrl = null;
+      greetingTextCached = "";
       return false;
     }
   })();
@@ -961,6 +932,14 @@ async function startCall() {
     if (!isCalling) return;
 
     statusText.textContent = "AI greeting you…";
+
+    const fallbackGreetingText =
+      "Alright brother. I’m here with you. Tell me what’s going on today.";
+    const greetingText = (greetingTextCached || "").trim() || fallbackGreetingText;
+
+    // ✅ Always transcribe greeting, even if audio falls back
+    sendAssistantTextToTranscript(greetingText);
+
     if (greetingOk && greetingAudioUrl) {
       await safePlayOnce(greetingAudioUrl, { limitMs: 60000 });
       try {
@@ -970,7 +949,7 @@ async function startCall() {
       }
       greetingAudioUrl = null;
     } else {
-      // Fallback to static greeting if serverless greeting failed
+      // fallback audio (but still transcribed via greetingText)
       await safePlayOnce("blake.mp3", { limitMs: 15000 });
     }
     if (!isCalling) return;
@@ -998,7 +977,6 @@ function endCall() {
   stopMicVAD();
   stopRing();
   stopBargeInMonitor();
-  aiTextStream?.stop?.(); // 🔵 stop live AI transcript if running
 
   try {
     globalStream?.getTracks().forEach((t) => t.stop());
@@ -1392,8 +1370,6 @@ async function playAIWithBargeIn(
         } catch (e) {
           // ignore
         }
-        // stop live AI transcript stream on barge-in
-        aiTextStream?.stop?.();
         statusText.textContent = "Go ahead…";
         cleanup();
       });
@@ -1511,8 +1487,6 @@ async function uploadRecordingAndNotify() {
   let revokeLater = null;
   let aiBlob = null;
   let aiTextFromJSON = "";
-  let assistantText = ""; // 🔵 NEW: explicit text from backend
-
   try {
     const body = {
       user_id,
@@ -1527,6 +1501,8 @@ async function uploadRecordingAndNotify() {
       executionMode: "production",
       source: "voice",
       audio_uploaded: uploaded,
+      // ✅ ensure the backend can link to the same conversation thread
+      conversationId: conversationId || null,
     };
 
     const resp = await fetch(CALL_COACH_ENDPOINT, {
@@ -1556,11 +1532,12 @@ async function uploadRecordingAndNotify() {
       revokeLater = aiPlayableUrl;
     } else if (ct.includes("application/json")) {
       const data = await resp.json();
-      // 🔵 Prefer assistant_text field when present (Option A)
-      assistantText = (data?.assistant_text || "").trim();
       aiTextFromJSON =
-        assistantText ||
-        (data?.text ?? data?.transcript ?? data?.message ?? "");
+        data?.assistant_text ??
+        data?.text ??
+        data?.transcript ??
+        data?.message ??
+        "";
       const b64 = data?.audio_base64;
       const url =
         data?.result_audio_url ||
@@ -1604,17 +1581,6 @@ async function uploadRecordingAndNotify() {
     if (aiTextFromJSON) await typewriter(aiBubble, aiTextFromJSON, 18);
   }
 
-  // 🔵 Start "live" assistant transcript stream (Option A) when we have text and no N8N ASR
-  const textToStream =
-    (assistantText || aiTextFromJSON || "").trim() || "";
-  const shouldStreamAssistant =
-    !!textToStream && !N8N_TRANSCRIBE_URL; // don't double-stream if webhook is on
-
-  if (shouldStreamAssistant) {
-    aiTextStream?.stop?.();
-    aiTextStream = streamAssistantTextLive(textToStream);
-  }
-
   const { interrupted } = await playAIWithBargeIn(aiPlayableUrl, {
     aiBlob: !aiTextFromJSON ? aiBlob : null,
     aiBubbleEl: aiBubble,
@@ -1627,8 +1593,8 @@ async function uploadRecordingAndNotify() {
     }
   }
 
-  // If we did NOT simulate live streaming (or if webhook is on), still send a final line
-  if (!shouldStreamAssistant && aiTextFromJSON && !N8N_TRANSCRIBE_URL) {
+  // Mirror assistant text into the live transcript panel (Option A)
+  if (aiTextFromJSON) {
     sendAssistantTextToTranscript(aiTextFromJSON);
   }
 
@@ -1759,6 +1725,7 @@ async function sendChatToN8N(userText) {
         rolling_summary: rollingSummary || undefined,
         executionMode: "production",
         source: "chat",
+        conversationId: conversationId || null,
       }),
     });
 
@@ -1803,6 +1770,7 @@ async function sendChatToN8N(userText) {
     const aiBubble = appendMsg("ai", "", { typing: true });
     if (aiText) {
       await typewriter(aiBubble, aiText, 18);
+      sendAssistantTextToTranscript(aiText);
     }
 
     if (playableUrl) {
