@@ -7,6 +7,7 @@
 // PATCHED:
 // ✅ Embed "ready" handshake -> parent can queue messages (prevents missing greeting)
 // ✅ Embed-mode message accept is limited to parent window only (safer than "*")
+// ✅ Auto-scroll is more robust and turns off when the user scrolls up
 
 import { supabase } from "./supabase.js";
 
@@ -43,7 +44,11 @@ function fmtTime(input) {
 
 function scrollToBottom() {
   if (!els.list || !autoScrollEnabled) return;
-  els.list.scrollTop = els.list.scrollHeight;
+  const el = els.list;
+  // Use rAF so layout has settled before we force scroll
+  window.requestAnimationFrame(() => {
+    el.scrollTop = el.scrollHeight;
+  });
 }
 
 function setLive(isLive) {
@@ -146,7 +151,8 @@ function handleRow(row, { animate = false } = {}) {
   // Prefer created_at; timestamp might not exist in your schema
   const ts = row.created_at || row.timestamp || new Date().toISOString();
 
-  if (row.input_transcript) appendTurn("user", row.input_transcript, ts, { animate });
+  if (row.input_transcript)
+    appendTurn("user", row.input_transcript, ts, { animate });
   if (row.ai_text) appendTurn("assistant", row.ai_text, ts, { animate });
 }
 
@@ -223,7 +229,10 @@ async function loadInitial(callId) {
 
   // If schema drifted and call_id column is named differently, attempt fallback.
   if (error) {
-    console.warn("[transcript] error loading call_sessions (call_id):", error);
+    console.warn(
+      "[transcript] error loading call_sessions (call_id):",
+      error
+    );
 
     const alt = await supabase
       .from("call_sessions")
@@ -232,7 +241,10 @@ async function loadInitial(callId) {
       .order("created_at", { ascending: true });
 
     if (alt.error) {
-      console.warn("[transcript] error loading call_sessions (callId):", alt.error);
+      console.warn(
+        "[transcript] error loading call_sessions (callId):",
+        alt.error
+      );
       appendTurn(
         "assistant",
         "I wasn't able to load the transcript for this call yet.",
@@ -360,6 +372,24 @@ els.closeBtn?.addEventListener("click", (e) => {
   else window.parent?.postMessage?.({ type: "sow-close-transcript" }, "*");
 });
 
+// 🔵 When user scrolls manually, toggle auto-scroll based on proximity to bottom
+if (els.list) {
+  els.list.addEventListener("scroll", () => {
+    const el = els.list;
+    const distanceFromBottom =
+      el.scrollHeight - el.scrollTop - el.clientHeight;
+    const nearBottom = distanceFromBottom < 48;
+
+    if (nearBottom && !autoScrollEnabled) {
+      autoScrollEnabled = true;
+      updateAutoScrollUI();
+    } else if (!nearBottom && autoScrollEnabled) {
+      autoScrollEnabled = false;
+      updateAutoScrollUI();
+    }
+  });
+}
+
 /* ---------- Embed mode: accept live postMessage from call.js ---------- */
 
 window.addEventListener("message", (event) => {
@@ -412,7 +442,10 @@ else {
 // ✅ Embed ready handshake so parent can flush queued transcript events (prevents missing greeting)
 if (isEmbed) {
   try {
-    window.parent?.postMessage?.({ source: "sow-transcript", type: "ready" }, "*");
+    window.parent?.postMessage?.(
+      { source: "sow-transcript", type: "ready" },
+      "*"
+    );
   } catch {
     // ignore
   }

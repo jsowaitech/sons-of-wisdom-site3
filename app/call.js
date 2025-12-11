@@ -176,6 +176,21 @@ const NO_RESPONSE = {
   ARM_DELAY_MS: 600,
 };
 
+const IDLE_FALLBACK = {
+  nudge: [
+    "It seems you’ve gone quiet for a moment. If you’re still here, I’m listening.",
+    "I haven’t heard you yet. Take your time—when you’re ready, you can tell me what’s going on.",
+  ],
+  end: [
+    "Since it’s been quiet for a while, I’ll go ahead and end our call for now. You’re always welcome to come back.",
+    "I haven’t heard anything more, so I’ll wrap our call here. I’m here whenever you’re ready to talk again.",
+  ],
+};
+
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
 let idleArmed = false;
 let idleStep = 0; // 0=none, 1=nudged
 let idleTimer1 = null;
@@ -325,7 +340,10 @@ function armIdleAfterAI() {
   idleArmed = true;
   idleStep = 0;
   // schedule first nudge
-  idleTimer1 = setTimeout(() => maybeRunNoResponseNudge(), NO_RESPONSE.FIRST_NUDGE_MS);
+  idleTimer1 = setTimeout(
+    () => maybeRunNoResponseNudge(),
+    NO_RESPONSE.FIRST_NUDGE_MS
+  );
 }
 
 function disarmIdle(reason = "") {
@@ -381,7 +399,9 @@ async function callCoachSystemEvent(eventType) {
 
   if (!resp.ok) {
     const t = await resp.text().catch(() => "");
-    throw new Error(`call-coach system_event ${resp.status}: ${t || resp.statusText}`);
+    throw new Error(
+      `call-coach system_event ${resp.status}: ${t || resp.statusText}`
+    );
   }
 
   const data = await resp.json().catch(() => ({}));
@@ -389,7 +409,9 @@ async function callCoachSystemEvent(eventType) {
   const b64 = data.audio_base64 || "";
   const mime = data.mime || "audio/mpeg";
 
-  if (!b64) throw new Error("system_event missing audio_base64");
+  if (!text && !b64) {
+    throw new Error("system_event missing text/audio");
+  }
   return { text, b64, mime };
 }
 
@@ -400,11 +422,20 @@ function base64ToBlobUrl(b64, mime = "audio/mpeg") {
   return URL.createObjectURL(blob);
 }
 
-async function playJsonTTS({ text, b64, mime }, { ringColor = "#d4a373" } = {}) {
+async function playJsonTTS(
+  { text, b64, mime },
+  { ringColor = "#d4a373" } = {}
+) {
+  // Always mirror assistant text to the transcript immediately
+  if (text) {
+    sendAssistantTextToTranscript(text);
+  }
+
+  // If there's no audio, we’re done (text-only idle line)
+  if (!b64) return;
+
   const url = base64ToBlobUrl(b64, mime);
   try {
-    // mirror text immediately (like Option A)
-    if (text) sendAssistantTextToTranscript(text);
     await safePlayOnce(url, { limitMs: 60_000, color: ringColor });
   } finally {
     try {
@@ -432,6 +463,9 @@ async function maybeRunNoResponseNudge() {
     await playJsonTTS(payload, { ringColor: "#d4a373" });
   } catch (e) {
     warn("no_response_nudge failed", e);
+    // Local fallback so user still sees a nudge if system_event fails
+    const text = pickRandom(IDLE_FALLBACK.nudge);
+    sendAssistantTextToTranscript(text);
   } finally {
     isPlayingAI = false;
     idleInFlight = false;
@@ -445,7 +479,10 @@ async function maybeRunNoResponseNudge() {
 
     // schedule end call
     idleStep = 1;
-    idleTimer2 = setTimeout(() => maybeRunNoResponseEnd(), NO_RESPONSE.END_CALL_MS);
+    idleTimer2 = setTimeout(
+      () => maybeRunNoResponseEnd(),
+      NO_RESPONSE.END_CALL_MS
+    );
   }
 }
 
@@ -465,6 +502,8 @@ async function maybeRunNoResponseEnd() {
     await playJsonTTS(payload, { ringColor: "#d4a373" });
   } catch (e) {
     warn("no_response_end failed", e);
+    const text = pickRandom(IDLE_FALLBACK.end);
+    sendAssistantTextToTranscript(text);
   } finally {
     isPlayingAI = false;
     idleInFlight = false;
@@ -1127,7 +1166,9 @@ async function startCall() {
   try {
     currentCallId = crypto.randomUUID();
   } catch {
-    currentCallId = `call_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    currentCallId = `call_${Date.now()}_${Math.random().toString(36).slice(
+      2
+    )}`;
   }
   try {
     localStorage.setItem("last_call_id", currentCallId);
@@ -1210,7 +1251,8 @@ function endCall() {
   }
   globalStream = null;
   try {
-    if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+    if (mediaRecorder && mediaRecorder.state !== "inactive")
+      mediaRecorder.stop();
   } catch (e) {
     // ignore
   }
@@ -1382,13 +1424,15 @@ function closeNativeRecognizer() {
 async function captureOneTurn() {
   if (!isCalling || isRecording || isPlayingAI) return false;
 
-  // NEW: if idle timers were armed, cancel — we're capturing user now
-  disarmIdle("captureOneTurn");
+  // Do NOT disarm idle just because we started listening.
+  // We only want to reset idle when the user actually speaks.
+  // disarmIdle("captureOneTurn");
 
   finalSegments = [];
   interimBuffer = "";
   transcriptUI.setInterim("Listening…");
-  noteUserActivity(); // NEW
+  // Do NOT mark this as user activity; they haven’t spoken yet.
+  // noteUserActivity();
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -1655,7 +1699,10 @@ async function uploadRecordingAndNotify() {
     noteUserActivity(); // NEW: user spoke
     recentUserTurns.push(combinedTranscript);
     if (recentUserTurns.length > RECENT_USER_KEEP) {
-      recentUserTurns.splice(0, recentUserTurns.length - RECENT_USER_KEEP);
+      recentUserTurns.splice(
+        0,
+        recentUserTurns.length - RECENT_USER_KEEP
+      );
     }
     // Title the conversation on first meaningful utterance if still untitled
     maybeUpdateConversationTitleFromTranscript(combinedTranscript).catch(
@@ -1791,7 +1838,9 @@ async function uploadRecordingAndNotify() {
         lastAIFinishedAt = Date.now();
         if (isCalling) armIdleAfterAI();
 
-        upsertRollingSummary(user_id, device, rollingSummary).catch(() => {});
+        upsertRollingSummary(user_id, device, rollingSummary).catch(
+          () => {}
+        );
         return true;
       }
     }
@@ -1958,7 +2007,10 @@ async function sendChatToN8N(userText) {
 
   recentUserTurns.push(userText);
   if (recentUserTurns.length > RECENT_USER_KEEP) {
-    recentUserTurns.splice(0, recentUserTurns.length - RECENT_USER_KEEP);
+    recentUserTurns.splice(
+      0,
+      recentUserTurns.length - RECENT_USER_KEEP
+    );
   }
 
   // Also allow chat text from call page to title an untitled conversation
@@ -1975,7 +2027,11 @@ async function sendChatToN8N(userText) {
   }
 
   const prevSummary = await fetchRollingSummary(user_id, device);
-  const rollingSummary = buildRollingSummary(prevSummary, historyPairs, userText);
+  const rollingSummary = buildRollingSummary(
+    prevSummary,
+    historyPairs,
+    userText
+  );
 
   const transcriptForModel = historyPairsText
     ? `Previous conversation (last ${Math.min(
