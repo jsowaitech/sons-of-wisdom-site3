@@ -1,6 +1,6 @@
 // app/call.js
 // Son of Wisdom — Call mode
-// UPDATED: idle-detection + system_event calls + transcript iframe handshake
+// Idle-detection + system_event calls + transcript iframe handshake
 // - If user doesn't respond after AI finishes:
 //   1) Blake sends a nudge (system_event: no_response_nudge)
 //   2) Then Blake sends an ending line (system_event: no_response_end) and call ends
@@ -15,12 +15,12 @@ import { supabase } from "./supabase.js";
 const DEBUG = true;
 
 /* Optional: Hume realtime SDK (safe stub if not loaded) */
-const HumeRealtime = (window.HumeRealtime ?? {
+const HumeRealtime = window.HumeRealtime ?? {
   init() {},
   startTurn() {},
   handleRecorderChunk() {},
   stopTurn() {},
-});
+};
 HumeRealtime.init?.({ enable: false });
 
 /* ---------- Supabase (OPTIONAL) ---------- */
@@ -66,7 +66,12 @@ const GREETING_ENDPOINT = "/.netlify/functions/call-greeting";
 /* ---------- I/O settings ---------- */
 const ENABLE_MEDIARECORDER_64KBPS = true;
 const TIMESLICE_MS = 100;
-const ENABLE_STREAMED_PLAYBACK = true;
+
+// Disable streamed playback on mobile (more fragile there)
+const IS_MOBILE = /Mobi|Android|iPhone|iPad/i.test(
+  navigator.userAgent || ""
+);
+const ENABLE_STREAMED_PLAYBACK = !IS_MOBILE;
 
 /* ---------- USER / DEVICE ---------- */
 const USER_ID_KEY = "sow_user_id";
@@ -154,13 +159,6 @@ const HAS_NATIVE_ASR =
   "SpeechRecognition" in window || "webkitSpeechRecognition" in window;
 let speechRecognizer = null;
 
-if (!HAS_NATIVE_ASR) {
-  // Helpful warning on platforms without Web Speech (most mobile browsers)
-  console.warn(
-    "[SOW] Native speech recognition not available; call-mode live transcript will not work on this device."
-  );
-}
-
 /* Audio routing */
 let playbackAC = null;
 const managedAudios = new Set();
@@ -176,9 +174,9 @@ let greetingAudioUrl = null;
 /* ---------- NEW: Idle detection (no response) ---------- */
 const NO_RESPONSE = {
   // after AI finishes speaking, wait this long for user to speak
-  FIRST_NUDGE_MS: 20_000, // 20 seconds
+  FIRST_NUDGE_MS: 20_000,
   // after the nudge is spoken, wait this long for user to speak
-  END_CALL_MS: 20_000, // 20 seconds
+  END_CALL_MS: 20_000,
   // minimum time after AI speech before any idle logic can run
   ARM_DELAY_MS: 600,
 };
@@ -385,13 +383,13 @@ function disarmIdle(reason = "") {
 
 function shouldConsiderIdle() {
   if (!isCalling) return false;
-  // NOTE: we intentionally allow idle checks while recording, because
+  // we intentionally allow idle checks while recording;
   // "idle" means we're listening but the user isn't speaking.
   if (isPlayingAI) return false;
   if (!idleArmed) return false;
   // don't fire immediately; give UI a moment
   if (Date.now() - lastAIFinishedAt < NO_RESPONSE.ARM_DELAY_MS) return false;
-  // if user has done something recently, don't idle
+  // if user has done something very recently, don't idle
   if (Date.now() - lastUserActivityAt < 400) return false;
   return true;
 }
@@ -1234,16 +1232,6 @@ async function startCall() {
     greetingPayload = null;
     prepareGreetingForNextCall();
 
-    // If this browser doesn't support native speech recognition,
-    // we can't safely run the live call loop. Fail gracefully.
-    if (!HAS_NATIVE_ASR) {
-      statusText.textContent =
-        "This browser doesn’t fully support live call mode. Please use desktop Chrome or type in chat.";
-      endCall();
-      return;
-    }
-
-    statusText.textContent = "Listening…";
     await startRecordingLoop();
   } catch (e) {
     warn("startCall error", e);
@@ -1347,7 +1335,9 @@ async function startRecordingLoop() {
     if (!ok) continue;
     const played = await uploadRecordingAndNotify();
     if (!isCalling) break;
-    statusText.textContent = played ? "Your turn…" : "Listening again…";
+    statusText.textContent = played
+      ? "Your turn – I’m listening…"
+      : "Listening again…";
   }
 }
 
@@ -1440,14 +1430,17 @@ function closeNativeRecognizer() {
       r.stop();
     }
   } catch (e) {
-    warn("closeNativeRecognizer error:", e);
+    warn("closeNativeRecognizer error", e);
   }
 }
 
 async function captureOneTurn() {
   if (!isCalling || isRecording || isPlayingAI) return false;
 
-  // We intentionally do NOT disarm idle here; this is the period
+  // Status should clearly show it's the user's turn
+  statusText.textContent = "Your turn – I’m listening…";
+
+  // we intentionally do NOT disarm idle here; this is the period
   // where we want to detect "no response" if the user stays silent.
 
   finalSegments = [];
@@ -1485,9 +1478,6 @@ async function captureOneTurn() {
 
     recordChunks = [];
     isRecording = true;
-
-    // Make it very obvious it's their turn now
-    statusText.textContent = "Listening…";
 
     mediaRecorder.ondataavailable = (e) => {
       if (e.data?.size > 0) {
@@ -1669,7 +1659,12 @@ async function playAIWithBargeIn(
     const okMic = await ensureLiveMicForBargeIn();
 
     let interrupted = false;
-    const cleanup = () => {
+    let cleaned = false;
+
+    const finish = (reason) => {
+      if (cleaned) return;
+      cleaned = true;
+
       stopRing();
       stopBargeInMonitor();
       isPlayingAI = false;
@@ -1677,6 +1672,11 @@ async function playAIWithBargeIn(
       // mark AI finished and arm idle timers for no-response flow
       lastAIFinishedAt = Date.now();
       if (isCalling) armIdleAfterAI();
+
+      if (reason === "blocked") {
+        statusText.textContent =
+          "I couldn’t play audio on this device. Check your volume or browser settings.";
+      }
 
       resolve({ interrupted });
     };
@@ -1690,20 +1690,21 @@ async function playAIWithBargeIn(
           // ignore
         }
         statusText.textContent = "Go ahead…";
-
-        // user is interrupting -> counts as activity
-        noteUserActivity();
-
-        cleanup();
+        noteUserActivity(); // user interrupt = activity
+        finish("barge");
       });
     }
+
+    a.onended = () => finish("ended");
+    a.onabort = () => finish("abort");
+    a.onerror = () => finish("error");
 
     try {
       await a.play();
     } catch (e) {
-      // ignore
+      // Autoplay or playback blocked -> don't get stuck in "AI replying…"
+      finish("blocked");
     }
-    a.onended = () => cleanup();
   });
 }
 
@@ -1749,7 +1750,7 @@ async function uploadRecordingAndNotify() {
   const mimeType = mediaRecorder?.mimeType || "audio/webm";
   const blob = new Blob(recordChunks, { type: mimeType });
   if (!blob.size || !isCalling) {
-    statusText.textContent = "No audio captured.";
+    statusText.textContent = "I didn’t catch any audio. Let’s try again.";
     return false;
   }
 
@@ -1914,7 +1915,8 @@ async function uploadRecordingAndNotify() {
 
   if (!isCalling) return false;
   if (!aiPlayableUrl) {
-    statusText.textContent = "AI processing failed (no audio).";
+    statusText.textContent =
+      "AI processing failed, I couldn’t get audio back. Let’s try again.";
     return false;
   }
 
@@ -2203,7 +2205,10 @@ async function playStreamedWebmOpus(response) {
       if (!started) {
         started = true;
         try {
-          a.play();
+          a.play().catch(() => {
+            // playback blocked, we won't wait forever
+            a.dispatchEvent(new Event("ended"));
+          });
         } catch (e) {
           // ignore
         }
