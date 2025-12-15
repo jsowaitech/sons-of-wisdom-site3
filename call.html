@@ -56,7 +56,7 @@
           </div>
           <div class="call-timer" id="call-timer">00:00</div>
 
-          <!-- Hidden in-call transcript (still needed for JS hooks) -->
+          <!-- Hidden obsolete transcript (kept for compatibility if you still reference it) -->
           <div id="transcript" class="call-transcript" style="display:none;">
             <div id="transcript-list" class="transcript-list"></div>
             <div id="transcript-interim" class="transcript-interim"></div>
@@ -113,14 +113,45 @@
       </section>
     </section>
 
-    <!-- Right-hand live transcript panel -->
+    <!-- Right-hand live transcript panel (DIRECT, NO IFRAME) -->
     <aside class="call-side-transcript" aria-label="Live transcription">
-      <iframe
-        id="callTranscriptFrame"
-        src="transcript.html?embed=1"
-        title="Live call transcription"
-        loading="lazy"
-      ></iframe>
+      <div class="transcript-wrap" style="height:100%;min-height:0;">
+        <div class="ts-header" style="padding-bottom:0.45rem;">
+          <div class="title-wrap">
+            <div class="title-left">
+              <span class="dot" aria-hidden="true"></span>
+              <h1 style="margin:0;">Live Transcription</h1>
+            </div>
+            <div class="sub">
+              <span class="live is-live">Live</span>
+              <span class="muted">Updates as you speak</span>
+            </div>
+          </div>
+
+          <div class="actions">
+            <button id="ts-clear" class="ghost" type="button" title="Clear transcript">
+              Clear
+            </button>
+          </div>
+        </div>
+
+        <div id="tsList" class="ts-list" style="flex:1;min-height:0;">
+          <div id="transcriptList" class="transcript-list"></div>
+          <div id="transcriptInterim" class="transcript-interim"></div>
+        </div>
+
+        <div class="ts-footer">
+          <div class="row">
+            <span>Auto-scroll</span>
+            <button id="ts-autoscroll" class="btn small ghost" type="button" aria-pressed="true">
+              On
+            </button>
+          </div>
+          <span class="hint">
+            Tip: Press <code>c</code> to return to chat.
+          </span>
+        </div>
+      </div>
     </aside>
   </main>
 
@@ -128,7 +159,7 @@
     Built for sons, warriors, and kings learning to govern their homes.
   </footer>
 
-  <!-- Back to home (same conversation) + optional iframe param wiring -->
+  <!-- Back to home (same conversation) -->
   <script type="module">
     const params = new URLSearchParams(window.location.search);
     const conversationId = params.get("c");
@@ -142,19 +173,6 @@
         if (conversationId) url.searchParams.set("c", conversationId);
         window.location.replace(url.toString());
       });
-    }
-
-    // Nice-to-have: if call.js stored last_call_id, include it for initial transcript load
-    const frame = document.getElementById("callTranscriptFrame");
-    try {
-      const callId = window.localStorage.getItem("last_call_id");
-      if (frame && callId) {
-        const u = new URL(frame.getAttribute("src"), window.location.origin);
-        u.searchParams.set("call_id", callId);
-        frame.setAttribute("src", u.toString().replace(window.location.origin, ""));
-      }
-    } catch (e) {
-      // ignore
     }
   </script>
 

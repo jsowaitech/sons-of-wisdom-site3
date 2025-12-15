@@ -1,6 +1,6 @@
 // app/call.js
 // Son of Wisdom — Call mode
-// Idle-detection + system_event calls + transcript iframe handshake
+// Idle-detection + system_event calls + INLINE transcript panel (no iframe)
 // - If user doesn't respond after AI finishes:
 //   1) Blake sends a nudge (system_event: no_response_nudge)
 //   2) Then Blake sends an ending line (system_event: no_response_end) and call ends
@@ -63,15 +63,23 @@ const CALL_COACH_ENDPOINT = "/.netlify/functions/call-coach";
 /* ---------- Netlify / ElevenLabs greeting ---------- */
 const GREETING_ENDPOINT = "/.netlify/functions/call-greeting";
 
+/* ---------- Deepgram token endpoint (Netlify function) ---------- */
+const DEEPGRAM_TOKEN_ENDPOINT = "/.netlify/functions/deepgram-token";
+
 /* ---------- I/O settings ---------- */
 const ENABLE_MEDIARECORDER_64KBPS = true;
 const TIMESLICE_MS = 100;
 
 // Disable streamed playback on mobile (more fragile there)
-const IS_MOBILE = /Mobi|Android|iPhone|iPad/i.test(
-  navigator.userAgent || ""
-);
+const IS_MOBILE = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent || "");
 const ENABLE_STREAMED_PLAYBACK = !IS_MOBILE;
+
+/**
+ * ✅ Deepgram fallback runs ONLY on mobile.
+ * - On desktop: use Web Speech API if available
+ * - On mobile: use Deepgram WS streaming for interim/final captions
+ */
+const USE_DEEPGRAM_ON_MOBILE = IS_MOBILE;
 
 /* ---------- USER / DEVICE ---------- */
 const USER_ID_KEY = "sow_user_id";
@@ -127,13 +135,18 @@ const threadLink =
   document.getElementById("thread-link") ||
   document.getElementById("btn-thread");
 
-// Transcript (call view)
-const transcriptList = document.getElementById("transcript-list");
-const transcriptInterim = document.getElementById("transcript-interim");
+// Legacy hidden transcript container (kept for compatibility)
+const legacyTranscriptList = document.getElementById("transcript-list");
+const legacyTranscriptInterim = document.getElementById("transcript-interim");
 
-/* 🔵 Live transcript panel iframe (right-hand side) */
-const transcriptFrame =
-  document.querySelector(".call-side-transcript iframe") || null;
+// ✅ Inline transcript panel (right-hand side, now on call.html)
+const transcriptListEl =
+  document.getElementById("transcriptList") || legacyTranscriptList;
+const transcriptInterimEl =
+  document.getElementById("transcriptInterim") || legacyTranscriptInterim;
+
+const tsClearBtn = document.getElementById("ts-clear");
+const tsAutoScrollBtn = document.getElementById("ts-autoscroll");
 
 // Chat (created lazily, but Switch-to-Chat now navigates to home.html)
 let chatPanel = document.getElementById("chat-panel");
@@ -189,168 +202,99 @@ let lastUserActivityAt = Date.now(); // updated on speech/interim/final and when
 let lastAIFinishedAt = 0; // set when AI audio finishes (or is interrupted)
 let idleInFlight = false;
 
-/* ---------- Helpers ---------- */
+/* ---------- INLINE TRANSCRIPT: UI + helpers ---------- */
+let autoScrollOn = true;
+let lastFinalLine = ""; // user last final dedupe
+
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
 const warn = (...a) => DEBUG && console.warn("[SOW]", ...a);
 const trimText = (s, n = 360) => (s || "").trim().slice(0, n);
 
-// Call duration timer helpers
-function resetCallTimer() {
-  // Full reset: used on page load and before a *new* call
-  callStartedAt = null;
-  if (callTimerInterval) {
-    clearInterval(callTimerInterval);
-    callTimerInterval = null;
-  }
-  if (callTimerEl) {
-    callTimerEl.textContent = "00:00";
-  }
-}
-
-function stopCallTimer() {
-  // Stop ticking but keep whatever time is currently shown
-  if (callTimerInterval) {
-    clearInterval(callTimerInterval);
-    callTimerInterval = null;
-  }
-}
-
-function updateCallTimer() {
-  if (!callTimerEl || !callStartedAt) return;
-  const elapsedSec = Math.floor((Date.now() - callStartedAt) / 1000);
-  const mins = Math.floor(elapsedSec / 60);
-  const secs = elapsedSec % 60;
-  const mm = String(mins).padStart(2, "0");
-  const ss = String(secs).padStart(2, "0");
-  callTimerEl.textContent = `${mm}:${ss}`;
-}
-
-function startCallTimer() {
-  // New call: reset to 00:00 and start counting
-  resetCallTimer();
-  callStartedAt = Date.now();
-  updateCallTimer();
-  callTimerInterval = setInterval(updateCallTimer, 1000);
-}
-
-/* 🔵 Transcript iframe bridge with handshake + queue */
-let transcriptPanelReady = false;
-const transcriptEventQueue = [];
-
-function flushTranscriptEventQueue() {
-  if (!transcriptFrame || !transcriptFrame.contentWindow) return;
-  while (transcriptEventQueue.length) {
-    const payload = transcriptEventQueue.shift();
-    try {
-      transcriptFrame.contentWindow.postMessage(
-        { source: "sow-call", ...payload },
-        "*"
-      );
-    } catch (e) {
-      warn("postToTranscriptPanel flush error", e);
-      break;
-    }
-  }
-}
-
-// Listen for "ready" handshake from transcript.html?embed=1
-window.addEventListener("message", (event) => {
-  const data = event.data || {};
-  if (data.source === "sow-transcript" && data.type === "ready") {
-    transcriptPanelReady = true;
-    flushTranscriptEventQueue();
-  }
-});
-
-/* 🔵 Bridge helper: send events to the live transcript iframe */
-function postToTranscriptPanel(payload) {
-  // If iframe not ready yet, queue the event
-  if (
-    !transcriptFrame ||
-    !transcriptFrame.contentWindow ||
-    !transcriptPanelReady
-  ) {
-    transcriptEventQueue.push(payload);
-    return;
-  }
+function nowHHMM() {
   try {
-    transcriptFrame.contentWindow.postMessage(
-      { source: "sow-call", ...payload },
-      "*" // use * so it also works on file:// during local dev
-    );
-  } catch (e) {
-    warn("postToTranscriptPanel error", e);
+    return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return "";
   }
 }
 
-/* Helper to send assistant text as a final turn */
-function sendAssistantTextToTranscript(text) {
-  const s = (text || "").trim();
-  if (!s) return;
-  postToTranscriptPanel({
-    type: "final",
-    text: s,
-    speaker: "assistant",
-  });
-}
+function scrollTranscriptToBottom() {
+  if (!autoScrollOn) return;
+  if (!transcriptListEl) return;
 
-/* Helper to send assistant interim text (optional) */
-function sendAssistantInterimToTranscript(text) {
-  const s = (text || "").trim();
-  if (!s) return;
-  postToTranscriptPanel({
-    type: "interim",
-    text: s,
-    speaker: "assistant",
-  });
-}
-
-/* Derive a short conversation title from first user utterance */
-function deriveTitleFromText(raw) {
-  let t = (raw || "").replace(/\s+/g, " ").trim();
-  if (!t) return null;
-
-  const max = 80;
-  if (t.length > max) {
-    let cut = t.lastIndexOf(" ", max);
-    if (cut < 30) cut = max;
-    t = t.slice(0, cut);
-  }
-
-  // strip leading non-alnum, trailing punctuation
-  t = t.replace(/^[^A-Za-z0-9]+/, "").replace(/[\s\-–—_,.:;!?]+$/, "");
-  if (!t) return null;
-
-  return t.charAt(0).toUpperCase() + t.slice(1);
-}
-
-async function maybeUpdateConversationTitleFromTranscript(text) {
-  if (!conversationId || conversationTitleLocked) return;
-  const title = deriveTitleFromText(text);
-  if (!title || title.length < 4) return;
+  const scroller =
+    transcriptListEl.closest(".ts-list") ||
+    transcriptListEl.closest(".call-side-transcript") ||
+    transcriptListEl;
 
   try {
-    const { error } = await supabase
-      .from("conversations")
-      .update({ title })
-      .eq("id", conversationId)
-      .or("title.is.null,title.eq.New Conversation");
-
-    if (error) {
-      warn("Conversation title update error:", error);
-      return;
-    }
-    conversationTitleLocked = true;
-    log("[SOW] Conversation title set from call transcript:", title);
-  } catch (e) {
-    warn("Conversation title update failed:", e);
+    scroller.scrollTop = scroller.scrollHeight;
+  } catch {
+    // ignore
   }
+}
+
+function setAutoScroll(on) {
+  autoScrollOn = !!on;
+  if (tsAutoScrollBtn) {
+    tsAutoScrollBtn.setAttribute("aria-pressed", String(autoScrollOn));
+    tsAutoScrollBtn.textContent = autoScrollOn ? "On" : "Off";
+  }
+  if (autoScrollOn) scrollTranscriptToBottom();
+}
+
+function ensureTranscriptElementsExist() {
+  if (!transcriptListEl || !transcriptInterimEl) {
+    warn("Transcript elements not found. Check call.html ids.");
+  }
+}
+
+function addTranscriptTurn(speaker, text) {
+  const s = (text || "").trim();
+  if (!s || !transcriptListEl) return;
+
+  const turn = document.createElement("div");
+  turn.className = `turn ${speaker === "assistant" ? "assistant" : "user"}`;
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+
+  const role = document.createElement("span");
+  role.className = "role";
+  role.textContent = speaker === "assistant" ? "BLAKE" : "YOU";
+
+  const time = document.createElement("span");
+  time.className = "time";
+  time.textContent = nowHHMM();
+
+  meta.appendChild(role);
+  meta.appendChild(time);
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+
+  const body = document.createElement("div");
+  body.className = "text";
+  body.textContent = s;
+
+  bubble.appendChild(body);
+  turn.appendChild(meta);
+  turn.appendChild(bubble);
+
+  transcriptListEl.appendChild(turn);
+  scrollTranscriptToBottom();
+}
+
+function setTranscriptInterim(_speaker, text) {
+  if (!transcriptInterimEl) return;
+  const t = (text || "").trim();
+  transcriptInterimEl.textContent = t ? t : "";
+  if (t) scrollTranscriptToBottom();
 }
 
 /* ---------- NEW: Idle detection helpers ---------- */
 function noteUserActivity() {
   lastUserActivityAt = Date.now();
-  // if user does anything meaningful, disarm idle logic for this cycle
   cancelIdleTimers();
   idleArmed = false;
   idleStep = 0;
@@ -366,7 +310,6 @@ function armIdleAfterAI() {
   cancelIdleTimers();
   idleArmed = true;
   idleStep = 0;
-  // schedule first nudge
   idleTimer1 = setTimeout(
     () => maybeRunNoResponseNudge(),
     NO_RESPONSE.FIRST_NUDGE_MS
@@ -383,23 +326,17 @@ function disarmIdle(reason = "") {
 
 function shouldConsiderIdle() {
   if (!isCalling) return false;
-  // we intentionally allow idle checks while recording;
-  // "idle" means we're listening but the user isn't speaking.
   if (isPlayingAI) return false;
   if (!idleArmed) return false;
-  // don't fire immediately; give UI a moment
   if (Date.now() - lastAIFinishedAt < NO_RESPONSE.ARM_DELAY_MS) return false;
-  // if user has done something very recently, don't idle
   if (Date.now() - lastUserActivityAt < 400) return false;
   return true;
 }
 
 async function callCoachSystemEvent(eventType) {
-  // eventType: "no_response_nudge" | "no_response_end"
   const user_id = getUserIdForWebhook();
   const device = getOrCreateDeviceId();
 
-  // ensure call_id exists
   if (!currentCallId) {
     try {
       currentCallId =
@@ -451,15 +388,10 @@ function base64ToBlobUrl(b64, mime = "audio/mpeg") {
 async function playJsonTTS({ text, b64, mime }, { ringColor = "#d4a373" } = {}) {
   const url = base64ToBlobUrl(b64, mime);
   try {
-    // mirror text immediately
-    if (text) sendAssistantTextToTranscript(text);
+    if (text) addTranscriptTurn("assistant", text);
     await safePlayOnce(url, { limitMs: 60_000, color: ringColor });
   } finally {
-    try {
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      // ignore
-    }
+    try { URL.revokeObjectURL(url); } catch {}
   }
 }
 
@@ -475,7 +407,6 @@ async function maybeRunNoResponseNudge() {
     const payload = await callCoachSystemEvent("no_response_nudge");
     if (!isCalling) return;
 
-    // while nudge plays, prevent recording loop from starting
     isPlayingAI = true;
     await playJsonTTS(payload, { ringColor: "#d4a373" });
   } catch (e) {
@@ -485,13 +416,11 @@ async function maybeRunNoResponseNudge() {
     idleInFlight = false;
     if (!isCalling) return;
 
-    // If user started speaking during/after, bail
     if (Date.now() - lastUserActivityAt < 500) {
       disarmIdle("user activity after nudge");
       return;
     }
 
-    // schedule end call
     idleStep = 1;
     idleTimer2 = setTimeout(
       () => maybeRunNoResponseEnd(),
@@ -520,16 +449,86 @@ async function maybeRunNoResponseEnd() {
     isPlayingAI = false;
     idleInFlight = false;
     if (!isCalling) return;
-    // end the call regardless (even if the end line failed)
     endCall();
+  }
+}
+
+/* ---------- Call duration timer helpers ---------- */
+function resetCallTimer() {
+  callStartedAt = null;
+  if (callTimerInterval) {
+    clearInterval(callTimerInterval);
+    callTimerInterval = null;
+  }
+  if (callTimerEl) callTimerEl.textContent = "00:00";
+}
+
+function stopCallTimer() {
+  if (callTimerInterval) {
+    clearInterval(callTimerInterval);
+    callTimerInterval = null;
+  }
+}
+
+function updateCallTimer() {
+  if (!callTimerEl || !callStartedAt) return;
+  const elapsedSec = Math.floor((Date.now() - callStartedAt) / 1000);
+  const mins = Math.floor(elapsedSec / 60);
+  const secs = elapsedSec % 60;
+  callTimerEl.textContent = `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function startCallTimer() {
+  resetCallTimer();
+  callStartedAt = Date.now();
+  updateCallTimer();
+  callTimerInterval = setInterval(updateCallTimer, 1000);
+}
+
+/* Derive a short conversation title from first user utterance */
+function deriveTitleFromText(raw) {
+  let t = (raw || "").replace(/\s+/g, " ").trim();
+  if (!t) return null;
+
+  const max = 80;
+  if (t.length > max) {
+    let cut = t.lastIndexOf(" ", max);
+    if (cut < 30) cut = max;
+    t = t.slice(0, cut);
+  }
+
+  t = t.replace(/^[^A-Za-z0-9]+/, "").replace(/[\s\-–—_,.:;!?]+$/, "");
+  if (!t) return null;
+
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+async function maybeUpdateConversationTitleFromTranscript(text) {
+  if (!conversationId || conversationTitleLocked) return;
+  const title = deriveTitleFromText(text);
+  if (!title || title.length < 4) return;
+
+  try {
+    const { error } = await supabase
+      .from("conversations")
+      .update({ title })
+      .eq("id", conversationId)
+      .or("title.is.null,title.eq.New Conversation");
+
+    if (error) {
+      warn("Conversation title update error:", error);
+      return;
+    }
+    conversationTitleLocked = true;
+    log("[SOW] Conversation title set from call transcript:", title);
+  } catch (e) {
+    warn("Conversation title update failed:", e);
   }
 }
 
 /* ---------- History / Summary (Supabase via REST, optional) ---------- */
 async function fetchLastPairsFromSupabase(user_id, { pairs = 8 } = {}) {
-  if (!HAS_SUPABASE) {
-    return { text: "", pairs: [] };
-  }
+  if (!HAS_SUPABASE) return { text: "", pairs: [] };
   try {
     const uuid = pickUuidForHistory(user_id);
     const url = new URL(`${SUPABASE_REST}/${encodeURIComponent(HISTORY_TABLE)}`);
@@ -616,12 +615,7 @@ async function upsertRollingSummary(user_id, device, summary) {
   }
 }
 
-function buildRollingSummary(
-  prevSummary,
-  pairs,
-  newest,
-  maxChars = SUMMARY_MAX_CHARS
-) {
+function buildRollingSummary(prevSummary, pairs, newest, maxChars = SUMMARY_MAX_CHARS) {
   const sentences = [];
   if (prevSummary) sentences.push(prevSummary);
   for (const p of pairs.slice(-6)) {
@@ -635,8 +629,7 @@ function buildRollingSummary(
       const t = s.trim().replace(/\s+/g, " ");
       let score = 0;
       if (/[0-9]/.test(t)) score += 1;
-      if (/(goal|need|want|plan|decide|next|todo|fix|issue)/i.test(t))
-        score += 2;
+      if (/(goal|need|want|plan|decide|next|todo|fix|issue)/i.test(t)) score += 2;
       if (t.length >= 40 && t.length <= 160) score += 1;
       if (/^User now:/i.test(t)) score += 3;
       return { t, score };
@@ -687,20 +680,13 @@ function ensureChatUI() {
       if (!txt) return;
       chatInput.value = "";
       appendMsg("me", txt);
-      noteUserActivity(); // counts as response activity
+      noteUserActivity();
       await sendChatToN8N(txt);
     });
     chatForm._wired = true;
   }
 }
 ensureChatUI();
-
-function showChatView() {
-  inChatView = true;
-  if (chatPanel) chatPanel.style.display = "block";
-  statusText.textContent = "Chat view on. Call continues in background.";
-  updateModeBtnUI();
-}
 
 function showCallView() {
   inChatView = false;
@@ -735,42 +721,49 @@ async function typewriter(el, full, delay = 24) {
   }
 }
 
-/* transcript list helpers (call view) */
-let lastFinalLine = "";
+/* transcript helpers (inline panel) */
 const transcriptUI = {
   clearAll() {
-    transcriptInterim.textContent = "";
-    transcriptList.innerHTML = "";
+    if (transcriptInterimEl) transcriptInterimEl.textContent = "";
+    if (transcriptListEl) transcriptListEl.innerHTML = "";
     lastFinalLine = "";
-    // also clear the right-hand panel
-    postToTranscriptPanel({ type: "clear" });
+
+    if (legacyTranscriptInterim && legacyTranscriptInterim !== transcriptInterimEl) {
+      legacyTranscriptInterim.textContent = "";
+    }
+    if (legacyTranscriptList && legacyTranscriptList !== transcriptListEl) {
+      legacyTranscriptList.innerHTML = "";
+    }
+
+    scrollTranscriptToBottom();
   },
+
   setInterim(t) {
-    const text = t || "";
-    transcriptInterim.textContent = text;
-    if (!text) return;
-    postToTranscriptPanel({
-      type: "interim",
-      text,
-      speaker: "user",
-    });
-    noteUserActivity(); // interim counts as activity
+    const text = (t || "").trim();
+    if (!text) {
+      setTranscriptInterim("user", "");
+      return;
+    }
+    setTranscriptInterim("user", text);
+    noteUserActivity();
   },
+
   addFinalLine(t) {
     const s = (t || "").trim();
     if (!s || s === lastFinalLine) return;
     lastFinalLine = s;
-    const div = document.createElement("div");
-    div.className = "transcript-line";
-    div.textContent = s;
-    transcriptList.appendChild(div);
-    transcriptList.scrollTop = transcriptList.scrollHeight;
-    postToTranscriptPanel({
-      type: "final",
-      text: s,
-      speaker: "user",
-    });
-    noteUserActivity(); // final counts as activity
+
+    if (legacyTranscriptList) {
+      const div = document.createElement("div");
+      div.className = "transcript-line";
+      div.textContent = s;
+      legacyTranscriptList.appendChild(div);
+      legacyTranscriptList.scrollTop = legacyTranscriptList.scrollHeight;
+    }
+
+    addTranscriptTurn("user", s);
+    setTranscriptInterim("user", "");
+    noteUserActivity();
   },
 };
 
@@ -809,17 +802,9 @@ let ringRAF = null;
 function stopRing() {
   if (ringRAF) cancelAnimationFrame(ringRAF);
   ringRAF = null;
-  try {
-    ringAnalyser?.disconnect();
-  } catch (e) {
-    // ignore
-  }
+  try { ringAnalyser?.disconnect(); } catch {}
   if (ringCtx && ringCtx.state !== "closed") {
-    try {
-      ringCtx.close();
-    } catch (e) {
-      // ignore
-    }
+    try { ringCtx.close(); } catch {}
   }
   ringCtx = ringAnalyser = null;
   drawVoiceRing();
@@ -844,7 +829,7 @@ function animateRingFromElement(mediaEl, color = "#d4a373") {
       src.connect(gain);
       gain.connect(analyser);
       analyser.connect(playbackAC.destination);
-    } catch (e) {
+    } catch {
       return;
     }
     const data = new Uint8Array(analyser.fftSize);
@@ -870,9 +855,7 @@ function animateRingFromElement(mediaEl, color = "#d4a373") {
       analyser?.disconnect();
       gain?.disconnect();
       src?.disconnect();
-    } catch (e) {
-      // ignore
-    }
+    } catch {}
     drawVoiceRing();
   };
 
@@ -925,7 +908,6 @@ function startMicVAD(stream, color = "#d4a373") {
     const graceOver = elapsed > VAD.GRACE_MS;
     const minLen = elapsed > VAD.MIN_RECORD_MS;
 
-    // ring from analyser
     let acc = 0;
     for (let i = 0; i < data.length; i++) {
       const v = data[i] - 128;
@@ -962,17 +944,209 @@ function stopMicVAD() {
   try {
     vadSource?.disconnect();
     vadAnalyser?.disconnect();
-  } catch (e) {
-    // ignore
-  }
+  } catch {}
   if (vadCtx && vadCtx.state !== "closed") {
-    try {
-      vadCtx.close();
-    } catch (e) {
-      // ignore
-    }
+    try { vadCtx.close(); } catch {}
   }
   vadCtx = vadAnalyser = vadSource = null;
+}
+
+/* ---------- Deepgram Mobile Fallback (Streaming WS) ---------- */
+const DG = {
+  enable: USE_DEEPGRAM_ON_MOBILE,
+  endpoint: "wss://api.deepgram.com/v1/listen",
+  model: "nova-3",
+  language: "en-US",
+  smart_format: true,
+  punctuate: true,
+  interim_results: true,
+  vad_events: false,
+  endpointing: 50, // ms - helps finalize (optional)
+  sample_rate: 16000,
+};
+
+let dgSocket = null;
+let dgCtx = null;
+let dgSource = null;
+let dgProcessor = null;
+let dgInputSampleRate = 48000; // replaced at runtime
+let dgInterim = "";
+
+// Minimal downsampler Float32 -> Int16 PCM (little-endian)
+function downsampleTo16k(float32, inSampleRate, outSampleRate = 16000) {
+  if (outSampleRate === inSampleRate) return float32;
+
+  const ratio = inSampleRate / outSampleRate;
+  const newLen = Math.round(float32.length / ratio);
+  const result = new Float32Array(newLen);
+
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32.length; i++) {
+      accum += float32[i];
+      count++;
+    }
+    result[offsetResult] = count ? accum / count : 0;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return result;
+}
+
+function floatTo16BitPCM(float32) {
+  const buffer = new ArrayBuffer(float32.length * 2);
+  const view = new DataView(buffer);
+  let offset = 0;
+  for (let i = 0; i < float32.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, float32[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buffer;
+}
+
+async function fetchDeepgramToken() {
+  const resp = await fetch(`${DEEPGRAM_TOKEN_ENDPOINT}?ttl=60`, { method: "GET" });
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`Deepgram token HTTP ${resp.status}: ${t || resp.statusText}`);
+  }
+  const data = await resp.json().catch(() => ({}));
+  if (!data.access_token) throw new Error("Deepgram token missing access_token");
+  return data.access_token;
+}
+
+function buildDeepgramWsUrl(token) {
+  const u = new URL(DG.endpoint);
+  u.searchParams.set("model", DG.model);
+  u.searchParams.set("language", DG.language);
+  u.searchParams.set("smart_format", String(!!DG.smart_format));
+  u.searchParams.set("punctuate", String(!!DG.punctuate));
+  u.searchParams.set("interim_results", String(!!DG.interim_results));
+  u.searchParams.set("endpointing", String(DG.endpointing));
+  u.searchParams.set("encoding", "linear16");
+  u.searchParams.set("sample_rate", String(DG.sample_rate));
+  u.searchParams.set("channels", "1");
+
+  // ✅ Deepgram supports passing temporary token as query param for browser WS
+  u.searchParams.set("token", token);
+
+  return u.toString();
+}
+
+function stopDeepgramRecognizer() {
+  try {
+    if (dgProcessor) dgProcessor.onaudioprocess = null;
+  } catch {}
+  try { dgProcessor?.disconnect(); } catch {}
+  try { dgSource?.disconnect(); } catch {}
+  dgProcessor = dgSource = null;
+
+  if (dgCtx && dgCtx.state !== "closed") {
+    try { dgCtx.close(); } catch {}
+  }
+  dgCtx = null;
+
+  if (dgSocket) {
+    try { dgSocket.close(); } catch {}
+  }
+  dgSocket = null;
+  dgInterim = "";
+}
+
+async function startDeepgramRecognizer(stream) {
+  if (!DG.enable) return false;
+  stopDeepgramRecognizer();
+
+  let token = "";
+  try {
+    token = await fetchDeepgramToken();
+  } catch (e) {
+    warn("Deepgram token fetch failed:", e);
+    return false;
+  }
+
+  const wsUrl = buildDeepgramWsUrl(token);
+
+  let socket;
+  try {
+    socket = new WebSocket(wsUrl);
+  } catch (e) {
+    warn("Deepgram WebSocket create failed:", e);
+    return false;
+  }
+
+  dgSocket = socket;
+
+  socket.onopen = () => {
+    log("[SOW] Deepgram WS open");
+  };
+
+  socket.onerror = (e) => {
+    warn("[SOW] Deepgram WS error", e);
+  };
+
+  socket.onclose = () => {
+    log("[SOW] Deepgram WS closed");
+  };
+
+  socket.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      const alt = msg?.channel?.alternatives?.[0];
+      const transcript = (alt?.transcript || "").trim();
+      const isFinal = !!msg?.is_final;
+
+      if (!transcript) {
+        // clear interim when final with empty, or keep quiet
+        if (isFinal) transcriptUI.setInterim("");
+        return;
+      }
+
+      if (isFinal) {
+        transcriptUI.addFinalLine(transcript);
+        dgInterim = "";
+      } else {
+        dgInterim = transcript;
+        transcriptUI.setInterim(dgInterim);
+      }
+    } catch {
+      // ignore non-JSON frames
+    }
+  };
+
+  // audio graph: stream -> AudioContext -> ScriptProcessor -> PCM16 -> WS
+  dgCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (dgCtx.state === "suspended") dgCtx.resume().catch(() => {});
+  dgInputSampleRate = dgCtx.sampleRate || 48000;
+
+  dgSource = dgCtx.createMediaStreamSource(stream);
+
+  // ScriptProcessor is deprecated but still widely supported (including Safari)
+  const bufferSize = 4096;
+  dgProcessor = dgCtx.createScriptProcessor(bufferSize, 1, 1);
+  dgSource.connect(dgProcessor);
+  dgProcessor.connect(dgCtx.destination); // required in some browsers to keep it alive
+
+  dgProcessor.onaudioprocess = (e) => {
+    if (!dgSocket || dgSocket.readyState !== WebSocket.OPEN) return;
+    try {
+      const input = e.inputBuffer.getChannelData(0);
+      const down = downsampleTo16k(input, dgInputSampleRate, DG.sample_rate);
+      const pcm16 = floatTo16BitPCM(down);
+      dgSocket.send(pcm16);
+      // speaking implies activity
+      noteUserActivity();
+    } catch {
+      // ignore
+    }
+  };
+
+  return true;
 }
 
 /* ---------- Audio I/O helpers ---------- */
@@ -989,9 +1163,7 @@ async function routeElementToPreferredOutput(el) {
   if (!preferredOutputDeviceId) return;
   try {
     await el.setSinkId(preferredOutputDeviceId);
-  } catch (e) {
-    // ignore
-  }
+  } catch {}
 }
 
 async function pickSpeakerOutputDevice() {
@@ -1003,7 +1175,7 @@ async function pickSpeakerOutputDevice() {
     if (!outs.length) return null;
     const speakerish = outs.find((d) => /speaker/i.test(d.label));
     return speakerish?.deviceId || outs.at(-1).deviceId;
-  } catch (e) {
+  } catch {
     return null;
   }
 }
@@ -1070,13 +1242,11 @@ speakerBtn?.addEventListener("click", async () => {
   }
 });
 
-// Switch-to-Chat button now navigates back to home.html?c=...
 modeBtn?.addEventListener("click", (e) => {
   e.preventDefault();
   navigateToChatThread();
 });
 
-// Optional thread link in the footer
 threadLink?.addEventListener("click", (e) => {
   e.preventDefault();
   navigateToChatThread();
@@ -1087,6 +1257,15 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     navigateToChatThread();
   }
+});
+
+/* Inline transcript panel controls */
+tsClearBtn?.addEventListener("click", () => {
+  transcriptUI.clearAll();
+});
+
+tsAutoScrollBtn?.addEventListener("click", () => {
+  setAutoScroll(!autoScrollOn);
 });
 
 /* ---------- Greeting (ALWAYS transcribable) ---------- */
@@ -1123,11 +1302,7 @@ async function prepareGreetingForNextCall() {
       greetingPayload = payload;
 
       if (greetingAudioUrl) {
-        try {
-          URL.revokeObjectURL(greetingAudioUrl);
-        } catch (e) {
-          // ignore
-        }
+        try { URL.revokeObjectURL(greetingAudioUrl); } catch {}
       }
       greetingAudioUrl = base64ToBlobUrl(payload.audio_base64, payload.mime);
       log("[SOW] Greeting prefetched (JSON).");
@@ -1136,11 +1311,7 @@ async function prepareGreetingForNextCall() {
       warn("Greeting prefetch failed", e);
       greetingPayload = null;
       if (greetingAudioUrl) {
-        try {
-          URL.revokeObjectURL(greetingAudioUrl);
-        } catch (err) {
-          // ignore
-        }
+        try { URL.revokeObjectURL(greetingAudioUrl); } catch {}
       }
       greetingAudioUrl = null;
       return false;
@@ -1149,15 +1320,13 @@ async function prepareGreetingForNextCall() {
 }
 
 async function ensureGreetingReadyWithRetry() {
-  // If nothing queued, fetch now.
   if (!greetingReadyPromise) prepareGreetingForNextCall();
 
   let ok = await greetingReadyPromise;
-  greetingReadyPromise = null; // consumed
+  greetingReadyPromise = null;
 
   if (ok && greetingPayload && greetingAudioUrl) return true;
 
-  // Retry once (network hiccup / cold start)
   await new Promise((r) => setTimeout(r, 450));
   prepareGreetingForNextCall();
   ok = await greetingReadyPromise;
@@ -1174,19 +1343,14 @@ async function startCall() {
   disarmIdle("startCall");
   noteUserActivity();
 
-  // create a call_id for this session and store it
   try {
     currentCallId = crypto.randomUUID();
   } catch {
-    currentCallId = `call_${Date.now()}_${Math.random().toString(36).slice(
-      2
-    )}`;
+    currentCallId = `call_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   }
   try {
     localStorage.setItem("last_call_id", currentCallId);
-  } catch (e) {
-    // ignore storage errors
-  }
+  } catch {}
 
   callBtn.classList.add("call-active");
   transcriptUI.clearAll();
@@ -1198,7 +1362,6 @@ async function startCall() {
     await safePlayOnce("ring.mp3", { limitMs: 15000 });
     if (!isCalling) return;
 
-    // Ensure greeting is ready (or fetch if not)
     const greetingOk = await ensureGreetingReadyWithRetry();
     if (!isCalling) return;
 
@@ -1209,26 +1372,17 @@ async function startCall() {
       return;
     }
 
-    // Transcribe greeting BEFORE playback
     statusText.textContent = "AI greeting you…";
-    if (greetingPayload?.text) {
-      sendAssistantTextToTranscript(greetingPayload.text);
-    }
+    if (greetingPayload?.text) addTranscriptTurn("assistant", greetingPayload.text);
 
-    // Play greeting audio from Blob URL
     if (greetingAudioUrl) {
       await safePlayOnce(greetingAudioUrl, { limitMs: 60000 });
-      try {
-        URL.revokeObjectURL(greetingAudioUrl);
-      } catch (e) {
-        // ignore
-      }
+      try { URL.revokeObjectURL(greetingAudioUrl); } catch {}
       greetingAudioUrl = null;
     }
 
     if (!isCalling) return;
 
-    // Prepare next greeting in the background
     greetingPayload = null;
     prepareGreetingForNextCall();
 
@@ -1256,17 +1410,18 @@ function endCall() {
   stopRing();
   stopBargeInMonitor();
 
+  // stop Deepgram stream if active
+  stopDeepgramRecognizer();
+
   try {
     globalStream?.getTracks().forEach((t) => t.stop());
-  } catch (e) {
-    // ignore
-  }
+  } catch {}
   globalStream = null;
+
   try {
     if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
-  } catch (e) {
-    // ignore
-  }
+  } catch {}
+
   closeNativeRecognizer();
 
   for (const el of Array.from(managedAudios)) {
@@ -1275,19 +1430,12 @@ function endCall() {
       const src = el.src;
       el.src = "";
       if (src?.startsWith("blob:")) URL.revokeObjectURL(src);
-    } catch (e) {
-      // ignore
-    }
+    } catch {}
     managedAudios.delete(el);
   }
 
-  // cleanup greeting url if any
   if (greetingAudioUrl) {
-    try {
-      URL.revokeObjectURL(greetingAudioUrl);
-    } catch (e) {
-      // ignore
-    }
+    try { URL.revokeObjectURL(greetingAudioUrl); } catch {}
     greetingAudioUrl = null;
   }
 }
@@ -1312,7 +1460,7 @@ function safePlayOnce(src, { limitMs = 15000, color = "#d4a373" } = {}) {
     a.oncanplaythrough = () => {
       try {
         a.play().catch(() => settle(false));
-      } catch (e) {
+      } catch {
         settle(false);
       }
     };
@@ -1356,11 +1504,18 @@ function commitInterimToFinal() {
 }
 
 function openNativeRecognizer() {
+  // If Deepgram is enabled (mobile-only), prefer it over WebSpeech
+  if (DG.enable) {
+    log("[SOW] Mobile detected: using Deepgram for live transcription");
+    // Deepgram start happens in captureOneTurn (after we have stream)
+    return;
+  }
+
   const ASR = window.SpeechRecognition || window.webkitSpeechRecognition;
 
   log("ASR available?", !!ASR, ASR);
   if (!ASR) {
-    warn("Web Speech API not available; falling back to no live captions.");
+    warn("Web Speech API not available; no desktop live captions.");
     transcriptUI.setInterim("Listening…");
     return;
   }
@@ -1389,7 +1544,7 @@ function openNativeRecognizer() {
     }
     transcriptUI.setInterim(interim);
     interimBuffer = interim;
-    if (interim) noteUserActivity(); // user speaking
+    if (interim) noteUserActivity();
   };
 
   r.onerror = (e) => {
@@ -1437,11 +1592,7 @@ function closeNativeRecognizer() {
 async function captureOneTurn() {
   if (!isCalling || isRecording || isPlayingAI) return false;
 
-  // Status should clearly show it's the user's turn
   statusText.textContent = "Your turn – I’m listening…";
-
-  // we intentionally do NOT disarm idle here; this is the period
-  // where we want to detect "no response" if the user stays silent.
 
   finalSegments = [];
   interimBuffer = "";
@@ -1460,7 +1611,7 @@ async function captureOneTurn() {
       return false;
     }
     globalStream = stream;
-    updateMicTracks(); // respects micMuted state
+    updateMicTracks();
 
     let opts = {};
     if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
@@ -1472,7 +1623,7 @@ async function captureOneTurn() {
     }
     try {
       mediaRecorder = new MediaRecorder(stream, opts);
-    } catch (e) {
+    } catch {
       mediaRecorder = new MediaRecorder(stream);
     }
 
@@ -1492,12 +1643,23 @@ async function captureOneTurn() {
       stopMicVAD();
       stopRing();
       transcriptUI.setInterim("");
+
+      // stop live caption engines
+      stopDeepgramRecognizer();
       closeNativeRecognizer();
+
       HumeRealtime.stopTurn?.();
     };
 
     startMicVAD(stream, "#d4a373");
+
+    // Start captions:
     openNativeRecognizer();
+    if (DG.enable) {
+      // Deepgram mobile captions start here (requires stream)
+      startDeepgramRecognizer(stream).catch((e) => warn("Deepgram start failed", e));
+    }
+
     HumeRealtime.startTurn?.(stream, vadCtx);
     mediaRecorder.start(TIMESLICE_MS);
 
@@ -1591,11 +1753,7 @@ function startBargeInMonitor(onInterrupt) {
       if (rms > BARGE.rmsThresh) {
         hold += 16;
         if (hold >= BARGE.holdMs) {
-          try {
-            onInterrupt?.();
-          } catch (e) {
-            // ignore
-          }
+          try { onInterrupt?.(); } catch {}
           stopBargeInMonitor();
           return;
         }
@@ -1615,15 +1773,9 @@ function stopBargeInMonitor() {
   try {
     bargeSrc?.disconnect();
     bargeAnalyser?.disconnect();
-  } catch (e) {
-    // ignore
-  }
+  } catch {}
   if (bargeCtx && bargeCtx.state !== "closed") {
-    try {
-      bargeCtx.close();
-    } catch (e) {
-      // ignore
-    }
+    try { bargeCtx.close(); } catch {}
   }
   bargeCtx = bargeSrc = bargeAnalyser = null;
 }
@@ -1637,23 +1789,19 @@ async function playAIWithBargeIn(
     statusText.textContent = "AI replying…";
     isPlayingAI = true;
 
-    // during AI playback, don't run idle timers
     disarmIdle("AI playback start");
 
     const a = new Audio(playableUrl);
     registerAudioElement(a);
     animateRingFromElement(a, "#d4a373");
 
-    // live transcription webhook if configured (assistant interim/final)
     if (!aiBubbleEl && inChatView)
       aiBubbleEl = appendMsg("ai", "", { typing: true });
 
     if (aiBlob && N8N_TRANSCRIBE_URL) {
       try {
         liveTranscribeBlob(aiBlob, aiBubbleEl).catch(() => {});
-      } catch (e) {
-        // ignore
-      }
+      } catch {}
     }
 
     const okMic = await ensureLiveMicForBargeIn();
@@ -1669,7 +1817,6 @@ async function playAIWithBargeIn(
       stopBargeInMonitor();
       isPlayingAI = false;
 
-      // mark AI finished and arm idle timers for no-response flow
       lastAIFinishedAt = Date.now();
       if (isCalling) armIdleAfterAI();
 
@@ -1684,13 +1831,9 @@ async function playAIWithBargeIn(
     if (okMic) {
       startBargeInMonitor(() => {
         interrupted = true;
-        try {
-          a.pause();
-        } catch (e) {
-          // ignore
-        }
+        try { a.pause(); } catch {}
         statusText.textContent = "Go ahead…";
-        noteUserActivity(); // user interrupt = activity
+        noteUserActivity();
         finish("barge");
       });
     }
@@ -1701,8 +1844,7 @@ async function playAIWithBargeIn(
 
     try {
       await a.play();
-    } catch (e) {
-      // Autoplay or playback blocked -> don't get stuck in "AI replying…"
+    } catch {
       finish("blocked");
     }
   });
@@ -1720,21 +1862,17 @@ async function uploadRecordingAndNotify() {
   const combinedTranscript = finalText || interimText || "";
 
   if (combinedTranscript) {
-    noteUserActivity(); // user actually spoke
+    noteUserActivity();
     recentUserTurns.push(combinedTranscript);
     if (recentUserTurns.length > RECENT_USER_KEEP) {
       recentUserTurns.splice(0, recentUserTurns.length - RECENT_USER_KEEP);
     }
-    // Title the conversation on first meaningful utterance if still untitled
-    maybeUpdateConversationTitleFromTranscript(combinedTranscript).catch(
-      () => {}
-    );
+    maybeUpdateConversationTitleFromTranscript(combinedTranscript).catch(() => {});
   }
 
   const user_id = getUserIdForWebhook();
   const device = getOrCreateDeviceId();
 
-  // ensure we always have a call_id and keep it persisted
   if (!currentCallId) {
     try {
       currentCallId =
@@ -1756,16 +1894,13 @@ async function uploadRecordingAndNotify() {
 
   statusText.textContent = "Thinking…";
 
-  // history/summary
   let historyPairsText = "";
   let historyPairs = [];
   try {
     const hist = await fetchLastPairsFromSupabase(user_id, { pairs: 8 });
     historyPairsText = hist.text || "";
     historyPairs = hist.pairs || [];
-  } catch (e) {
-    // ignore; we already log inside helper
-  }
+  } catch {}
 
   const prevSummary = await fetchRollingSummary(user_id, device);
   const rollingSummary = buildRollingSummary(
@@ -1775,13 +1910,9 @@ async function uploadRecordingAndNotify() {
   );
 
   const transcriptForModel = historyPairsText
-    ? `Previous conversation (last ${Math.min(
-        historyPairs.length,
-        8
-      )} pairs), oldest→newest:\n${historyPairsText}\n\nUser now says:\n${combinedTranscript}`
+    ? `Previous conversation (last ${Math.min(historyPairs.length, 8)} pairs), oldest→newest:\n${historyPairsText}\n\nUser now says:\n${combinedTranscript}`
     : combinedTranscript;
 
-  // upload user audio to storage (OPTIONAL)
   let uploaded = false;
   if (HAS_SUPABASE) {
     try {
@@ -1800,9 +1931,7 @@ async function uploadRecordingAndNotify() {
         body: blob,
       });
       uploaded = upRes.ok;
-      if (!upRes.ok) {
-        warn("Supabase upload failed", upRes.status);
-      }
+      if (!upRes.ok) warn("Supabase upload failed", upRes.status);
     } catch (e) {
       warn("Supabase upload error", e);
     }
@@ -1810,7 +1939,6 @@ async function uploadRecordingAndNotify() {
     log("Skipping Supabase upload; HAS_SUPABASE is false.");
   }
 
-  // call Netlify call-coach (hard-coded workflow)
   let aiPlayableUrl = null;
   let revokeLater = null;
   let aiBlob = null;
@@ -1821,10 +1949,7 @@ async function uploadRecordingAndNotify() {
       user_id,
       device_id: device,
       call_id: currentCallId,
-
-      // pass the current utterance separately so backend can log it cleanly
       user_turn: combinedTranscript,
-
       transcript: transcriptForModel,
       has_transcript: !!transcriptForModel,
       history_user_last3: recentUserTurns.slice(-3),
@@ -1832,8 +1957,6 @@ async function uploadRecordingAndNotify() {
       executionMode: "production",
       source: "voice",
       audio_uploaded: uploaded,
-
-      // pass conversation/thread if present
       conversationId: conversationId || null,
       conversation_id: conversationId || null,
       c: conversationId || null,
@@ -1847,7 +1970,6 @@ async function uploadRecordingAndNotify() {
 
     const ct = (resp.headers.get("content-type") || "").toLowerCase();
 
-    // progressive stream first (kept for compatibility; call-coach may return audio)
     if (
       ENABLE_STREAMED_PLAYBACK &&
       ct.includes("audio/webm") &&
@@ -1855,10 +1977,6 @@ async function uploadRecordingAndNotify() {
     ) {
       const ok = await playStreamedWebmOpus(resp.clone());
       if (ok) {
-        // AI finished speaking; arm idle
-        lastAIFinishedAt = Date.now();
-        if (isCalling) armIdleAfterAI();
-
         upsertRollingSummary(user_id, device, rollingSummary).catch(() => {});
         return true;
       }
@@ -1871,7 +1989,6 @@ async function uploadRecordingAndNotify() {
     } else if (ct.includes("application/json")) {
       const data = await resp.json();
 
-      // use assistant_text if provided
       aiTextFromJSON = (
         data?.assistant_text ??
         data?.text ??
@@ -1892,9 +2009,7 @@ async function uploadRecordingAndNotify() {
       if (b64 && !url) {
         const raw = b64.includes(",") ? b64.split(",").pop() : b64;
         const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
-        aiBlob = new Blob([bytes], {
-          type: data?.mime || "audio/mpeg",
-        });
+        aiBlob = new Blob([bytes], { type: data?.mime || "audio/mpeg" });
         aiPlayableUrl = URL.createObjectURL(aiBlob);
         revokeLater = aiPlayableUrl;
       } else if (url) {
@@ -1920,12 +2035,8 @@ async function uploadRecordingAndNotify() {
     return false;
   }
 
-  // Mirror assistant text into transcript panel immediately
-  if (aiTextFromJSON) {
-    sendAssistantTextToTranscript(aiTextFromJSON);
-  }
+  if (aiTextFromJSON) addTranscriptTurn("assistant", aiTextFromJSON);
 
-  // If JSON gave us text and chat is open, type it
   let aiBubble = null;
   if (inChatView) {
     aiBubble = appendMsg("ai", "", { typing: true });
@@ -1938,11 +2049,7 @@ async function uploadRecordingAndNotify() {
   });
 
   if (revokeLater) {
-    try {
-      URL.revokeObjectURL(revokeLater);
-    } catch (e) {
-      // ignore
-    }
+    try { URL.revokeObjectURL(revokeLater); } catch {}
   }
 
   upsertRollingSummary(user_id, device, rollingSummary).catch(() => {});
@@ -1977,20 +2084,19 @@ async function liveTranscribeBlob(blob, aiBubbleEl) {
           if (evt.delta) {
             full += evt.delta;
             if (aiBubbleEl) aiBubbleEl.textContent = full;
-            sendAssistantInterimToTranscript(full);
           }
           if (evt.text && evt.done) {
             if (aiBubbleEl) aiBubbleEl.textContent = evt.text;
-            sendAssistantTextToTranscript(evt.text);
+            addTranscriptTurn("assistant", evt.text);
+            setTranscriptInterim("assistant", "");
             return true;
           }
-        } catch (e) {
-          // ignore
-        }
+        } catch {}
       }
     }
     if (full) {
-      sendAssistantTextToTranscript(full);
+      addTranscriptTurn("assistant", full);
+      setTranscriptInterim("assistant", "");
     }
     return !!full;
   };
@@ -2008,10 +2114,11 @@ async function liveTranscribeBlob(blob, aiBubbleEl) {
     if (text && aiBubbleEl) {
       await typewriter(aiBubbleEl, text, 18);
     }
-    if (text) sendAssistantTextToTranscript(text);
-  } catch (e) {
-    // ignore
-  }
+    if (text) {
+      addTranscriptTurn("assistant", text);
+      setTranscriptInterim("assistant", "");
+    }
+  } catch {}
 }
 
 async function blobToFormData(blob, field = "file", filename = "audio.mp3") {
@@ -2030,7 +2137,6 @@ async function sendChatToN8N(userText) {
     recentUserTurns.splice(0, recentUserTurns.length - RECENT_USER_KEEP);
   }
 
-  // Also allow chat text from call page to title an untitled conversation
   maybeUpdateConversationTitleFromTranscript(userText).catch(() => {});
 
   let historyPairsText = "";
@@ -2039,22 +2145,13 @@ async function sendChatToN8N(userText) {
     const hist = await fetchLastPairsFromSupabase(user_id, { pairs: 8 });
     historyPairsText = hist.text || "";
     historyPairs = hist.pairs || [];
-  } catch (e) {
-    // ignore
-  }
+  } catch {}
 
   const prevSummary = await fetchRollingSummary(user_id, device);
-  const rollingSummary = buildRollingSummary(
-    prevSummary,
-    historyPairs,
-    userText
-  );
+  const rollingSummary = buildRollingSummary(prevSummary, historyPairs, userText);
 
   const transcriptForModel = historyPairsText
-    ? `Previous conversation (last ${Math.min(
-        historyPairs.length,
-        8
-      )} pairs), oldest→newest:\n${historyPairsText}\n\nUser now says:\n${userText}`
+    ? `Previous conversation (last ${Math.min(historyPairs.length, 8)} pairs), oldest→newest:\n${historyPairsText}\n\nUser now says:\n${userText}`
     : userText;
 
   try {
@@ -2113,8 +2210,7 @@ async function sendChatToN8N(userText) {
     const aiBubble = appendMsg("ai", "", { typing: true });
     if (aiText) {
       await typewriter(aiBubble, aiText, 18);
-      // also mirror assistant text to the live transcript panel
-      sendAssistantTextToTranscript(aiText);
+      addTranscriptTurn("assistant", aiText);
     }
 
     if (playableUrl) {
@@ -2123,11 +2219,7 @@ async function sendChatToN8N(userText) {
         aiBubbleEl: aiBubble,
       });
       if (revoke) {
-        try {
-          URL.revokeObjectURL(revoke);
-        } catch (e) {
-          // ignore
-        }
+        try { URL.revokeObjectURL(revoke); } catch {}
       }
     }
 
@@ -2166,11 +2258,7 @@ async function playStreamedWebmOpus(response) {
           sb.addEventListener(
             "updateend",
             () => {
-              try {
-                ms.endOfStream();
-              } catch (e) {
-                // ignore
-              }
+              try { ms.endOfStream(); } catch {}
             },
             { once: true }
           );
@@ -2178,12 +2266,7 @@ async function playStreamedWebmOpus(response) {
       }
       await new Promise((r) => {
         const go = () => {
-          try {
-            sb.appendBuffer(value);
-          } catch (e) {
-            r();
-            return;
-          }
+          try { sb.appendBuffer(value); } catch { r(); return; }
         };
         if (!sb.updating) {
           go();
@@ -2206,41 +2289,35 @@ async function playStreamedWebmOpus(response) {
         started = true;
         try {
           a.play().catch(() => {
-            // playback blocked, we won't wait forever
             a.dispatchEvent(new Event("ended"));
           });
-        } catch (e) {
-          // ignore
-        }
+        } catch {}
       }
     });
 
     pump().catch(() => {
-      try {
-        ms.endOfStream();
-      } catch (e) {
-        // ignore
-      }
+      try { ms.endOfStream(); } catch {}
     });
 
     await new Promise((r) => (a.onended = r));
     URL.revokeObjectURL(url);
 
-    // streamed AI done, arm idle
     lastAIFinishedAt = Date.now();
     if (isCalling) armIdleAfterAI();
 
     return true;
-  } catch (e) {
+  } catch {
     return null;
   }
 }
 
 /* ---------- Boot ---------- */
+ensureTranscriptElementsExist();
 updateMicUI();
 updateSpeakerUI();
 updateModeBtnUI();
 showCallView();
 resetCallTimer();
+setAutoScroll(true);
 prepareGreetingForNextCall();
-log("[SOW] call.js ready");
+log("[SOW] call.js ready (Deepgram mobile fallback:", DG.enable, ")");
