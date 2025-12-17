@@ -51,6 +51,8 @@ const SUMMARY_MAX_CHARS = 380;
 const N8N_WEBHOOK_URL =
   "https://jsonofwisdom.app.n8n.cloud/webhook/4877ebea-544b-42b4-96d6-df41c58d48b0";
 
+const N8N_TRANSCRIBE_URL = "";
+
 const CALL_COACH_ENDPOINT = "/.netlify/functions/call-coach";
 const GREETING_ENDPOINT = "/.netlify/functions/call-greeting";
 const DEEPGRAM_TOKEN_ENDPOINT = "/.netlify/functions/deepgram-token";
@@ -1007,11 +1009,12 @@ async function fetchDeepgramToken() {
 }
 
 /**
- * Build Deepgram WS URL
- * - If includeTokenParam=true, appends token=<...> query param
- * - Otherwise, caller may authenticate via Sec-WebSocket-Protocol
+ * ✅ IMPORTANT FIX:
+ * Do NOT pass token in the query string.
+ * For browser WebSockets, authenticate with Sec-WebSocket-Protocol:
+ *   new WebSocket(url, ["token", access_token])
  */
-function buildDeepgramWsUrl(token, includeTokenParam = false) {
+function buildDeepgramWsUrl() {
   const u = new URL(DG.endpoint);
   u.searchParams.set("model", DG.model);
   u.searchParams.set("language", DG.language);
@@ -1022,12 +1025,21 @@ function buildDeepgramWsUrl(token, includeTokenParam = false) {
   u.searchParams.set("encoding", "linear16");
   u.searchParams.set("sample_rate", String(DG.sample_rate));
   u.searchParams.set("channels", "1");
-
-  if (includeTokenParam) {
-    u.searchParams.set("token", token);
-  }
-
   return u.toString();
+}
+
+function createDeepgramWebSocket(wsUrl, accessToken) {
+  // Most browsers accept (url, ["token", token])
+  try {
+    return new WebSocket(wsUrl, ["token", accessToken]);
+  } catch (e) {
+    // Fallback: some environments accept a single subprotocol string only
+    try {
+      return new WebSocket(wsUrl, "token");
+    } catch {
+      throw e;
+    }
+  }
 }
 
 function stopDeepgramRecognizer() {
@@ -1060,47 +1072,6 @@ function stopDeepgramRecognizer() {
   dgHudWsState("");
 }
 
-/**
- * Create a WS and wait briefly for "open" or an immediate failure.
- * This lets us try multiple auth strategies.
- */
-function openWsWithProbe({ url, protocols, probeMs = 1800 }) {
-  return new Promise((resolve) => {
-    let ws;
-    try {
-      ws = protocols ? new WebSocket(url, protocols) : new WebSocket(url);
-    } catch (e) {
-      resolve({ ok: false, ws: null, err: e });
-      return;
-    }
-
-    let done = false;
-    const finish = (ok, err) => {
-      if (done) return;
-      done = true;
-      resolve({ ok, ws, err });
-    };
-
-    const t = setTimeout(() => {
-      // If it hasn't errored/closed yet, assume it's viable and let normal handlers take over.
-      finish(true, null);
-    }, probeMs);
-
-    ws.onopen = () => {
-      clearTimeout(t);
-      finish(true, null);
-    };
-    ws.onerror = (e) => {
-      clearTimeout(t);
-      finish(false, e || new Error("ws error"));
-    };
-    ws.onclose = (evt) => {
-      clearTimeout(t);
-      finish(false, new Error(`ws closed early: ${evt?.code || ""} ${evt?.reason || ""}`));
-    };
-  });
-}
-
 async function startDeepgramRecognizer(stream) {
   if (!DG.enable) return false;
 
@@ -1123,27 +1094,19 @@ async function startDeepgramRecognizer(stream) {
     return false;
   }
 
-  // Strategy A (preferred): Auth via Sec-WebSocket-Protocol (works when query token is blocked)
-  // Strategy B (fallback): Auth via token= query param
-  const urlA = buildDeepgramWsUrl(token, false);
-  const urlB = buildDeepgramWsUrl(token, true);
+  const wsUrl = buildDeepgramWsUrl();
+  dgHudStatus("ws: connecting");
 
-  dgHudStatus("ws: connecting (proto)");
-  let probe = await openWsWithProbe({ url: urlA, protocols: ["token", token] });
-
-  if (!probe.ok) {
-    dgHudErr(`ws proto failed: ${String(probe.err?.message || probe.err || "")}`);
-    dgHudStatus("ws: retry (query token)");
-    probe = await openWsWithProbe({ url: urlB, protocols: null });
-  }
-
-  if (!probe.ok || !probe.ws) {
-    dgHudErr(`ws failed: ${String(probe.err?.message || probe.err || "")}`);
-    dgHudStatus("ws failed");
+  let socket;
+  try {
+    socket = createDeepgramWebSocket(wsUrl, token);
+  } catch (e) {
+    warn("Deepgram WebSocket create failed:", e);
+    dgHudErr(`ws create: ${String(e?.message || e)}`);
+    dgHudStatus("ws create failed");
     return false;
   }
 
-  const socket = probe.ws;
   dgSocket = socket;
 
   socket.onopen = () => {
@@ -1184,12 +1147,6 @@ async function startDeepgramRecognizer(stream) {
       if (isFinal) {
         transcriptUI.addFinalLine(transcript);
         dgInterim = "";
-
-        // ✅ CRITICAL FIX:
-        // When recording a turn, also add Deepgram final text to the turn transcript
-        if (isRecording) {
-          finalSegments.push(transcript);
-        }
       } else {
         dgInterim = transcript;
         transcriptUI.setInterim(dgInterim);
@@ -1205,7 +1162,7 @@ async function startDeepgramRecognizer(stream) {
 
   dgSource = dgCtx.createMediaStreamSource(stream);
 
-  // ScriptProcessor works on Safari (deprecated but still most compatible)
+  // ScriptProcessor works on Safari (deprecated but still supported)
   const bufferSize = 4096;
   dgProcessor = dgCtx.createScriptProcessor(bufferSize, 1, 1);
   dgSource.connect(dgProcessor);
@@ -1732,9 +1689,7 @@ async function captureOneTurn() {
     };
 
     mediaRecorder.onstop = () => {
-      // If we had interim from desktop ASR, commit it
       commitInterimToFinal();
-
       isRecording = false;
       stopMicVAD();
       stopRing();
@@ -1775,12 +1730,12 @@ async function captureOneTurn() {
 async function uploadRecordingAndNotify() {
   if (!recordChunks?.length) return false;
 
-  // ✅ If Deepgram was filling finalSegments during the turn, this will be non-empty on mobile now.
   const transcript = finalSegments.join(" ").replace(/\s+/g, " ").trim();
 
+  // ✅ IMPORTANT FIX: don’t hard-fail the entire call if transcript is empty
+  // (prevents call-coach 400 Missing transcript loops on mobile)
   if (!transcript) {
-    // Prevent 400 "Missing transcript"
-    statusText.textContent = "Didn’t catch that—please try again.";
+    statusText.textContent = "I didn’t catch that — try again.";
     return false;
   }
 
@@ -1826,8 +1781,8 @@ async function uploadRecordingAndNotify() {
     device_id: device,
     call_id: currentCallId,
     conversationId: conversationId || null,
-    transcript: transcript || "",
-    user_turn: transcript || "",
+    transcript: transcript,
+    user_turn: transcript,
     rolling_summary: rolling_summary || "",
     audio_url: audioUrl || "",
   };
