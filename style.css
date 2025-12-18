@@ -16,16 +16,7 @@ body {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
   color: #f9fafb;
-  background: var(--bg-gradient); /* ⬅️ always use the dark gradient */
-}
-
-/* Shell layout – no background here anymore */
-body.sow-shell {
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 1.5rem 1rem 1.25rem;
+  background: var(--bg-gradient); /* always use the dark gradient */
 }
 
 /* Theme tokens */
@@ -277,7 +268,7 @@ button:hover:not(:disabled),
   justify-content: center;
 }
 
-/* ✅ FIX: actually render a hamburger icon (3 bars) */
+/* FIX: actually render a hamburger icon (3 bars) */
 .icon-btn.hamburger {
   flex-direction: column;
   gap: 4px;
@@ -791,11 +782,7 @@ body.sow-shell main.content h2.tiny {
   gap: 0.4rem;
 }
 
-.conv-item {
-  margin-top: 0.4rem;
-}
-
-/* ✅ IMPORTANT: make conv-item work for both <button> and <div> wrappers */
+/* IMPORTANT: make conv-item work for both <button> and <div> wrappers */
 .conv-item {
   width: 100%;
   text-align: left;
@@ -837,12 +824,21 @@ body.sow-shell main.content h2.tiny {
 }
 
 /* =========================================================
-   HISTORY: 3-dot actions + menu (NEW)
+   HISTORY: 3-dot actions + menu
    ========================================================= */
 
 .conv-item {
   position: relative;
   padding-right: 3.1rem; /* room for kebab */
+}
+
+.conv-item[role="button"] {
+  cursor: pointer;
+}
+
+.conv-item.is-disabled {
+  opacity: 0.7;
+  pointer-events: none;
 }
 
 .conv-main {
@@ -900,7 +896,7 @@ body.sow-shell main.content h2.tiny {
   box-shadow: 0 18px 45px rgba(0, 0, 0, 0.75);
   backdrop-filter: blur(14px);
   display: none;
-  z-index: 50;
+  z-index: 60;
 }
 
 .conv-actions.open .conv-menu {
@@ -934,7 +930,7 @@ body.sow-shell main.content h2.tiny {
 }
 
 /* =========================================================
-   HISTORY: inline rename (NEW)
+   HISTORY: inline rename
    ========================================================= */
 
 .conv-item .title {
@@ -972,12 +968,6 @@ body.sow-shell main.content h2.tiny {
   border-color: rgba(246, 201, 121, 0.65);
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.75);
   transform: none;
-}
-
-/* ✅ Used by app/history.js when disabling a row during delete */
-.conv-item.is-busy {
-  opacity: 0.7;
-  pointer-events: none;
 }
 
 /* =========================================================
@@ -1310,7 +1300,7 @@ body.ts-live.embed .transcript-wrap {
   box-shadow: none;
   border: none;
 
-  /* 🔵 Make the inner layout fill the iframe so .ts-list can scroll */
+  /* Make the inner layout fill the iframe so .ts-list can scroll */
   height: 100%;
   min-height: 0;
   display: flex;
@@ -1358,7 +1348,7 @@ body.ts-live.embed .auto-scroll {
   .call-side-transcript {
     margin-top: 1rem;
     height: auto;
-    min-height: 60vh; /* 🔵 grow with viewport on mobile */
+    min-height: 60vh;
     max-height: none;
     padding: 0.85rem;
   }
@@ -1366,14 +1356,13 @@ body.ts-live.embed .auto-scroll {
 
 @media (max-width: 480px) {
   .call-side-transcript {
-    min-height: 65vh; /* a bit more space on very small phones */
+    min-height: 65vh;
     padding: 0.8rem;
   }
 }
 
 /* =========================================================
    FIX: Prevent chat bubble styles from affecting transcript turns
-   (Added patch)
    ========================================================= */
 
 /* 1) Scope the HOME/CHAT bubbles so they don't leak into transcript turns */
