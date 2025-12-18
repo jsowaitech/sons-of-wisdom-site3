@@ -1,13 +1,12 @@
 // app/history.js
 // Conversation history page controller
-// FIXED: per-conversation 3-dot menu overlays correctly + no aria-hidden focus warnings
-// Uses [hidden] instead of aria-hidden, and manages aria-expanded.
+// Per-conversation kebab menu: rename + delete
+// FIXES: menu stacking above rows + focus/hidden handling to avoid console warnings
 
 import { supabase, ensureAuthedOrRedirect } from "./supabase.js";
 
 const $ = (s, r = document) => r.querySelector(s);
 
-// Main list container (support either #list or #conversation-list)
 const listEl =
   $("#list") ||
   $("#conversation-list") ||
@@ -18,19 +17,12 @@ const listEl =
     return div;
   })();
 
-// Template (added in updated history.html)
 const itemTpl = $("#conv-item-template");
 
-// Query params
 const params = new URLSearchParams(window.location.search);
 const returnTo = params.get("returnTo") || "home.html";
 
-/* ----------------------------- helpers -------------------------------- */
-
-function initialFromEmail(email = "") {
-  const c = (email || "?").trim()[0] || "?";
-  return c.toUpperCase();
-}
+/* ---------------- helpers ---------------- */
 
 function convUrl(id) {
   const q = new URLSearchParams({ c: id }).toString();
@@ -73,62 +65,77 @@ async function getConvosFromSupabase(userId) {
   }));
 }
 
-/* -------------------------- menu handling ------------------------------ */
+/* ---------------- menu handling ---------------- */
 
-function closeAllMenus(exceptActionsEl = null) {
-  document.querySelectorAll(".conv-actions.open").forEach((actionsEl) => {
-    if (exceptActionsEl && actionsEl === exceptActionsEl) return;
+function closeAllMenus(exceptActions = null) {
+  document.querySelectorAll(".conv-actions.open").forEach((actions) => {
+    if (exceptActions && actions === exceptActions) return;
 
-    actionsEl.classList.remove("open");
+    const row = actions.closest(".conv-item");
+    const kebab = actions.querySelector(".conv-kebab");
+    const menu = actions.querySelector(".conv-menu");
 
-    const kebab = actionsEl.querySelector(".conv-kebab");
-    const menu = actionsEl.querySelector(".conv-menu");
+    // If focus is inside the menu and we’re about to hide it, move focus first
+    if (menu && menu.contains(document.activeElement)) {
+      kebab?.focus();
+    }
 
-    if (kebab) kebab.setAttribute("aria-expanded", "false");
+    actions.classList.remove("open");
     if (menu) menu.hidden = true;
+    kebab?.setAttribute("aria-expanded", "false");
+    row?.classList.remove("menu-open");
   });
 }
 
-function toggleMenu(actionsEl) {
-  const isOpen = actionsEl.classList.contains("open");
-  const kebab = actionsEl.querySelector(".conv-kebab");
-  const menu = actionsEl.querySelector(".conv-menu");
+function toggleMenu(actions) {
+  const row = actions.closest(".conv-item");
+  const kebab = actions.querySelector(".conv-kebab");
+  const menu = actions.querySelector(".conv-menu");
 
-  if (!menu) return;
+  const isOpen = actions.classList.contains("open");
 
   if (isOpen) {
-    actionsEl.classList.remove("open");
-    menu.hidden = true;
-    if (kebab) kebab.setAttribute("aria-expanded", "false");
-    // return focus to kebab for accessibility
-    kebab?.focus?.();
+    // close
+    if (menu && menu.contains(document.activeElement)) kebab?.focus();
+    actions.classList.remove("open");
+    if (menu) menu.hidden = true;
+    kebab?.setAttribute("aria-expanded", "false");
+    row?.classList.remove("menu-open");
     return;
   }
 
-  closeAllMenus(actionsEl);
-  actionsEl.classList.add("open");
-  menu.hidden = false;
-  if (kebab) kebab.setAttribute("aria-expanded", "true");
-
-  // Focus first item for keyboard users
-  const firstItem = menu.querySelector(".conv-menu-item");
-  firstItem?.focus?.();
+  // open
+  closeAllMenus(actions);
+  actions.classList.add("open");
+  if (menu) menu.hidden = false;
+  kebab?.setAttribute("aria-expanded", "true");
+  row?.classList.add("menu-open");
 }
 
-/* ------------------------- supabase actions ---------------------------- */
+document.addEventListener(
+  "click",
+  () => closeAllMenus(),
+  { capture: true }
+);
+
+document.addEventListener(
+  "keydown",
+  (e) => {
+    if (e.key === "Escape") closeAllMenus();
+  },
+  { capture: true }
+);
+
+/* ---------------- actions ---------------- */
 
 async function deleteConversation(convId) {
-  // Safe path if FK does not cascade:
-  // delete messages first to avoid FK errors.
+  // delete messages first (safe if FK isn’t cascade)
   const { error: msgErr } = await supabase
     .from("conversation_messages")
     .delete()
     .eq("conversation_id", convId);
 
-  if (msgErr) {
-    // If cascade exists, this may still be fine, but log it.
-    console.warn("[HISTORY] message delete warning:", msgErr);
-  }
+  if (msgErr) console.warn("[HISTORY] message delete warning:", msgErr);
 
   const { error: convErr } = await supabase
     .from("conversations")
@@ -154,11 +161,8 @@ async function renameConversation(convId, newTitle) {
   return finalTitle;
 }
 
-/* ------------------------------ UI ------------------------------------ */
-
 function showEmptyStateIfNeeded() {
-  const remaining =
-    listEl?.querySelectorAll(".conv-item:not(.empty)")?.length || 0;
+  const remaining = listEl?.querySelectorAll(".conv-item:not(.empty)")?.length || 0;
   if (remaining === 0) {
     const empty = document.createElement("div");
     empty.className = "conv-item empty";
@@ -176,9 +180,7 @@ function beginInlineRename(rowEl, conv) {
   const titleEditEl = rowEl.querySelector(".title-edit");
 
   if (!titleTextEl || !titleEditEl) {
-    alert(
-      "Rename UI missing. Please update history.html template to support inline rename."
-    );
+    alert("Rename UI missing. Please update history.html template.");
     return;
   }
 
@@ -211,6 +213,7 @@ function beginInlineRename(rowEl, conv) {
       return;
     }
 
+    // optimistic UI
     titleTextEl.textContent = nextTitle || "Untitled";
     conv.title = nextTitle || "Untitled";
 
@@ -243,7 +246,6 @@ function beginInlineRename(rowEl, conv) {
 
   const onKeyDown = async (e) => {
     e.stopPropagation();
-
     if (e.key === "Enter") {
       e.preventDefault();
       await commit();
@@ -259,9 +261,6 @@ function beginInlineRename(rowEl, conv) {
 
   titleEditEl.addEventListener("keydown", onKeyDown);
   titleEditEl.addEventListener("blur", onBlur);
-
-  // Prevent row click while editing
-  titleEditEl.addEventListener("click", (e) => e.stopPropagation());
 }
 
 function makeConvRow(c) {
@@ -270,6 +269,7 @@ function makeConvRow(c) {
   if (itemTpl?.content?.firstElementChild) {
     el = itemTpl.content.firstElementChild.cloneNode(true);
   } else {
+    // fallback (shouldn't happen if history.html is updated)
     el = document.createElement("button");
     el.type = "button";
     el.className = "conv-item";
@@ -277,23 +277,17 @@ function makeConvRow(c) {
       <div class="conv-main">
         <div class="title">
           <span class="title-text"></span>
-          <input class="title-edit" type="text" aria-label="Rename conversation" />
+          <input class="title-edit" type="text" aria-label="Conversation title" />
         </div>
         <div class="date tiny muted"></div>
       </div>
-
       <div class="conv-actions">
-        <button class="conv-kebab" type="button" aria-label="Conversation options" aria-expanded="false">
+        <button class="conv-kebab" type="button" aria-label="Conversation options" aria-haspopup="menu" aria-expanded="false">
           <span></span><span></span><span></span>
         </button>
-
         <div class="conv-menu" role="menu" hidden>
-          <button class="conv-menu-item" type="button" data-action="rename" role="menuitem">
-            Rename
-          </button>
-          <button class="conv-menu-item danger" type="button" data-action="delete" role="menuitem">
-            Delete
-          </button>
+          <button class="conv-menu-item" type="button" data-action="rename" role="menuitem">Rename</button>
+          <button class="conv-menu-item danger" type="button" data-action="delete" role="menuitem">Delete</button>
         </div>
       </div>
     `;
@@ -301,12 +295,12 @@ function makeConvRow(c) {
 
   el.dataset.convId = c.id;
 
-  const titleTextEl = el.querySelector(".title-text") || el.querySelector(".title");
+  const titleTextEl = el.querySelector(".title-text");
   const dateEl = el.querySelector(".date");
   if (titleTextEl) titleTextEl.textContent = c.title || "Untitled";
   if (dateEl) dateEl.textContent = formatDate(c.updated_at);
 
-  // Clicking the row opens the conversation (unless renaming)
+  // Row click opens conversation (unless renaming)
   el.addEventListener("click", () => {
     if (el.classList.contains("renaming")) return;
     window.location.href = convUrl(c.id);
@@ -316,18 +310,14 @@ function makeConvRow(c) {
   const kebab = el.querySelector(".conv-kebab");
   const menu = el.querySelector(".conv-menu");
 
-  // Ensure base accessibility state
-  kebab?.setAttribute("aria-expanded", "false");
-  if (menu) menu.hidden = true;
-
-  // Kebab should NOT open the conversation
+  // Kebab click: open menu (don’t navigate)
   kebab?.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
     if (actions) toggleMenu(actions);
   });
 
-  // Menu should NOT open the conversation
+  // Menu click: run actions (don’t navigate)
   menu?.addEventListener("click", async (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -337,11 +327,8 @@ function makeConvRow(c) {
 
     const action = btn.getAttribute("data-action");
 
-    // close menu
-    actions?.classList.remove("open");
-    if (menu) menu.hidden = true;
-    kebab?.setAttribute("aria-expanded", "false");
-    kebab?.focus?.();
+    // close menu immediately
+    closeAllMenus();
 
     if (action === "rename") {
       beginInlineRename(el, c);
@@ -352,7 +339,6 @@ function makeConvRow(c) {
       const ok = confirm("Delete this conversation? This cannot be undone.");
       if (!ok) return;
 
-      // optimistic UI
       el.classList.add("is-busy");
 
       try {
@@ -367,17 +353,8 @@ function makeConvRow(c) {
     }
   });
 
-  // Keyboard: close menu on Escape when focused inside it
-  menu?.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      actions?.classList.remove("open");
-      if (menu) menu.hidden = true;
-      kebab?.setAttribute("aria-expanded", "false");
-      kebab?.focus?.();
-    }
-  });
+  // Prevent edit input click from bubbling to row
+  el.querySelector(".title-edit")?.addEventListener("click", (e) => e.stopPropagation());
 
   return el;
 }
@@ -394,9 +371,7 @@ function renderConvos(convos) {
     return;
   }
 
-  for (const c of convos) {
-    listEl.appendChild(makeConvRow(c));
-  }
+  for (const c of convos) listEl.appendChild(makeConvRow(c));
 }
 
 async function createConversation(userId) {
@@ -418,27 +393,7 @@ async function createConversation(userId) {
   }
 }
 
-/* ------------------ global menu dismissal ----------------------------- */
-
-document.addEventListener(
-  "click",
-  (e) => {
-    // If click is inside a conv-actions block, don't immediately close it here.
-    if (e.target?.closest?.(".conv-actions")) return;
-    closeAllMenus();
-  },
-  { capture: true }
-);
-
-document.addEventListener(
-  "keydown",
-  (e) => {
-    if (e.key === "Escape") closeAllMenus();
-  },
-  { capture: true }
-);
-
-/* --------------------------- bindings --------------------------------- */
+/* ---------------- event bindings ---------------- */
 
 $("#btn-close")?.addEventListener("click", () => {
   const dest = decodeURIComponent(returnTo);
@@ -446,37 +401,17 @@ $("#btn-close")?.addEventListener("click", () => {
 });
 
 $("#btn-new")?.addEventListener("click", async () => {
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
+  const { data: { user } } = await supabase.auth.getUser();
   const id = await createConversation(user?.id);
-  if (id) {
-    window.location.href = convUrl(id);
-  }
+  if (id) window.location.href = convUrl(id);
 });
 
-/* ------------------------------ boot ---------------------------------- */
+/* ---------------- boot ---------------- */
 
 (async function boot() {
   await ensureAuthedOrRedirect();
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  // Optional bottom user row support (if you add it later)
-  const nameEl = $("#user-name");
-  const avatarEl = $("#avatar");
-
-  if (nameEl) {
-    nameEl.textContent =
-      user?.user_metadata?.full_name || user?.email || "You";
-  }
-  if (avatarEl) {
-    avatarEl.textContent = initialFromEmail(user?.email);
-  }
-
+  const { data: { user } } = await supabase.auth.getUser();
   const convos = await getConvosFromSupabase(user?.id);
   renderConvos(convos);
 })();

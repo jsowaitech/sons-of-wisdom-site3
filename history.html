@@ -9,7 +9,7 @@
 
 <body class="sow-shell">
   <header class="appbar">
-    <button id="btn-close" class="icon-btn" aria-label="Back to chat" title="Back">
+    <button id="btn-close" class="icon-btn" aria-label="Back to chat" title="Back" type="button">
       <span style="display:inline-block;font-size:22px;line-height:1;">×</span>
     </button>
 
@@ -17,7 +17,7 @@
       powered by <span class="brand-mini">Son of Wisdom</span>
     </div>
 
-    <button id="btn-new" class="btn pill small">+ New Conversation</button>
+    <button id="btn-new" class="btn pill small" type="button">+ New Conversation</button>
   </header>
 
   <main class="content" role="main">
@@ -29,15 +29,12 @@
     <section aria-label="Conversations" style="max-width:980px;margin:0 auto;">
       <h2 class="tiny muted" style="letter-spacing:.08em;margin:12px 0 10px;">CONVERSATIONS</h2>
 
-      <!-- This is where history.js will render the list -->
+      <!-- History renders here -->
       <div id="list" class="conv-list"></div>
     </section>
   </main>
 
-  <!--
-    Template used by app/history.js to render each conversation row w/ 3-dot menu
-    NOTE: Keep structure + classnames in sync with app/history.js and style.css
-  -->
+  <!-- Template used by app/history.js -->
   <template id="conv-item-template">
     <button class="conv-item" type="button" data-conv-id="">
       <div class="conv-main">
@@ -49,11 +46,16 @@
       </div>
 
       <div class="conv-actions">
-        <button class="conv-kebab" type="button" aria-label="Conversation options" aria-haspopup="menu" aria-expanded="false">
+        <button
+          class="conv-kebab"
+          type="button"
+          aria-label="Conversation options"
+          aria-haspopup="menu"
+          aria-expanded="false"
+        >
           <span></span><span></span><span></span>
         </button>
 
-        <!-- Use `hidden` instead of aria-hidden to avoid Chrome console warnings about focused descendants -->
         <div class="conv-menu" role="menu" hidden>
           <button class="conv-menu-item" type="button" data-action="rename" role="menuitem">
             Rename
@@ -66,7 +68,6 @@
     </button>
   </template>
 
-  <!-- Load the history controller -->
   <script type="module" src="app/history.js"></script>
 </body>
 </html>
