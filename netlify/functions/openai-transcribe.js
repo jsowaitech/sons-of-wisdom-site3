@@ -1,35 +1,40 @@
 // netlify/functions/openai-transcribe.js
+// ✅ Properly adds model=whisper-1 to OpenAI transcription requests
+
+import Busboy from "busboy";
+import FormData from "form-data";
+import fetch from "node-fetch";
+
 export async function handler(event) {
-  try {
-    const cors = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
+  const cors = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Cache-Control": "no-store",
+  };
+
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 204, headers: cors, body: "" };
+  }
+
+  if (event.httpMethod !== "POST") {
+    return {
+      statusCode: 405,
+      headers: { ...cors, "Content-Type": "application/json" },
+      body: JSON.stringify({ error: "Method not allowed" }),
     };
+  }
 
-    if (event.httpMethod === "OPTIONS") {
-      return { statusCode: 204, headers: { ...cors, "Cache-Control": "no-store" }, body: "" };
-    }
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return {
+      statusCode: 500,
+      headers: { ...cors, "Content-Type": "application/json" },
+      body: JSON.stringify({ error: "Missing OPENAI_API_KEY env var" }),
+    };
+  }
 
-    if (event.httpMethod !== "POST") {
-      return {
-        statusCode: 405,
-        headers: { ...cors, "Content-Type": "application/json" },
-        body: JSON.stringify({ error: "Method not allowed" }),
-      };
-    }
-
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return {
-        statusCode: 500,
-        headers: { ...cors, "Content-Type": "application/json" },
-        body: JSON.stringify({ error: "Missing OPENAI_API_KEY env var" }),
-      };
-    }
-
-    // Expect multipart/form-data from the browser
-    // Netlify provides raw body; we forward it to OpenAI as-is.
+  try {
     const contentType = event.headers["content-type"] || event.headers["Content-Type"];
     if (!contentType?.includes("multipart/form-data")) {
       return {
@@ -39,14 +44,53 @@ export async function handler(event) {
       };
     }
 
+    const bb = Busboy({ headers: { "content-type": contentType } });
+
+    let audioBuffer = null;
+    let audioFilename = "audio.webm";
+
+    bb.on("file", (name, file, info) => {
+      audioFilename = info.filename || audioFilename;
+
+      const chunks = [];
+      file.on("data", (d) => chunks.push(d));
+      file.on("end", () => {
+        audioBuffer = Buffer.concat(chunks);
+      });
+    });
+
+    await new Promise((resolve, reject) => {
+      bb.on("finish", resolve);
+      bb.on("error", reject);
+
+      const body = event.isBase64Encoded
+        ? Buffer.from(event.body, "base64")
+        : Buffer.from(event.body);
+
+      bb.end(body);
+    });
+
+    if (!audioBuffer) {
+      return {
+        statusCode: 400,
+        headers: { ...cors, "Content-Type": "application/json" },
+        body: JSON.stringify({ error: "No audio received" }),
+      };
+    }
+
+    // ✅ Build correct OpenAI multipart body
+    const fd = new FormData();
+    fd.append("file", audioBuffer, { filename: audioFilename });
+    fd.append("model", "whisper-1"); // ✅ REQUIRED
+    fd.append("response_format", "json");
+
     const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
-        // IMPORTANT: keep the boundary from the incoming request
-        "Content-Type": contentType,
+        ...fd.getHeaders(),
       },
-      body: event.isBase64Encoded ? Buffer.from(event.body, "base64") : event.body,
+      body: fd,
     });
 
     if (!resp.ok) {
@@ -61,13 +105,13 @@ export async function handler(event) {
     const data = await resp.json();
     return {
       statusCode: 200,
-      headers: { ...cors, "Content-Type": "application/json", "Cache-Control": "no-store" },
+      headers: { ...cors, "Content-Type": "application/json" },
       body: JSON.stringify({ text: data.text || "" }),
     };
   } catch (e) {
     return {
       statusCode: 500,
-      headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" },
+      headers: { ...cors, "Content-Type": "application/json" },
       body: JSON.stringify({ error: "Server error", details: String(e?.message || e) }),
     };
   }
