@@ -1,36 +1,25 @@
 // app/call.js
-// Son of Wisdom — Call mode (Free Talk + VAD + Barge-in + Merge + Premium Rings)
+// Son of Wisdom — Call mode (Free Talk + Frontend VAD + Barge-in + Merge + Premium Rings)
 //
-// ✅ Endpoints:
+// ✅ Endpoints you have:
 //    - /.netlify/functions/openai-transcribe  (audio -> transcript)
 //    - /.netlify/functions/call-coach         (transcript -> AI text + TTS audio)
 //
-// ✅ Real VAD Silence Detection (browser-based):
-//    - Starts recording when user speaks
-//    - Stops automatically after silence
-//    - No fixed min/max turn cutoffs
+// ✅ Fixes applied in this version:
+//    1) Transcription now includes required form-data fields: model (+ optional response_format)
+//    2) Barge-in now CANCELS playback promise immediately (no hanging until timeout)
+//    3) End Call now aborts in-flight fetches + cancels merge timers + cancels playback cleanly
+//    4) VAD now uses ADAPTIVE noise floor (works across devices / noisy mics better)
+//    5) ring.mp3 now truly "plays once" (no loop). Also never overlaps with AI playback.
+//    6) Guards after awaits: nothing continues if call ended mid-transcribe/mid-coach
 //
-// ✅ Turn Merging:
-//    - If user pauses briefly and continues, merges into one transcript
-//
-// ✅ Barge-in:
-//    - If AI is speaking and user starts talking, AI audio stops immediately
-//
-// ✅ ring.mp3 integrated:
-//    - plays once when call connects
-//
-// ✅ Premium rings:
-//    - User ring reacts to mic volume
-//    - AI ring reacts to AI audio volume
+// ✅ UI rings:
+//    - User ring reacts to mic energy
+//    - AI ring reacts to AI playback energy
 //
 // ✅ iOS Safari hardened:
 //    - unlockAudioSystem runs ONLY on Start Call tap
-//    - single shared audio player
-//
-// ✅ Uses transcript DOM from call.html:
-//    #transcriptList + #transcriptInterim
-//
-// ✅ No n8n
+//    - shared audio player for AI playback
 
 const DEBUG = true;
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -39,6 +28,11 @@ const warn = (...a) => DEBUG && console.warn("[SOW]", ...a);
 /* ---------- ENDPOINTS ---------- */
 const CALL_COACH_ENDPOINT = "/.netlify/functions/call-coach";
 const TRANSCRIBE_ENDPOINT = "/.netlify/functions/openai-transcribe";
+
+/* ---------- TRANSCRIBE MODEL (IMPORTANT) ---------- */
+// Prefer the new transcribe model; fallback to whisper-1 if you want.
+const TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
+// const TRANSCRIBE_MODEL = "whisper-1";
 
 /* ---------- URL PARAMS ---------- */
 const urlParams = new URLSearchParams(window.location.search);
@@ -59,7 +53,7 @@ const transcriptInterim = document.getElementById("transcriptInterim");
 const clearBtn = document.getElementById("ts-clear");
 const autoscrollBtn = document.getElementById("ts-autoscroll");
 
-/* Canvas rings (optional) */
+/* Canvas rings */
 const voiceRing = document.getElementById("voiceRing");
 
 /* ---------- STATE ---------- */
@@ -88,31 +82,47 @@ let vadSource = null;
 let vadAnalyser = null;
 let vadData = null;
 let vadLoopRunning = false;
-let lastVoiceTime = 0;
-let currentSpeechStartedAt = 0;
-let speechDetected = false;
 let vadState = "idle";
+let lastVoiceTime = 0;
+let speechStartTime = 0;
 
-/* VAD tuning */
-const VAD_THRESHOLD = 0.035;          // energy threshold (adjust if needed)
-const VAD_SILENCE_MS = 900;           // silence duration that ends turn
-const VAD_MERGE_WINDOW_MS = 1100;     // if user resumes speech within this, merge
-const VAD_MIN_SPEECH_MS = 220;        // ignore tiny noises
-const VAD_IDLE_TIMEOUT_MS = 25000;    // if no speech for this long, stay idle but alive
+/* Adaptive noise floor */
+let noiseFloor = 0.01;           // baseline RMS
+let noiseSamples = 0;
+let lastNoiseUpdate = 0;
+
+/* VAD tuning (adaptive) */
+const VAD_SILENCE_MS = 850;       // silence duration that ends turn
+const VAD_MERGE_WINDOW_MS = 1100; // pause window for merging
+const VAD_MIN_SPEECH_MS = 260;    // ignore tiny blips
+const VAD_IDLE_TIMEOUT_MS = 25000;
+
+/* Adaptive threshold shaping */
+const NOISE_FLOOR_UPDATE_MS = 250;   // how often we refine baseline
+const THRESHOLD_MULTIPLIER = 2.2;    // baseline * multiplier => "voice"
+const THRESHOLD_MIN = 0.018;         // never go below this
+const THRESHOLD_MAX = 0.085;         // never go above this
 
 /* ---------- iOS detection ---------- */
 const IS_IOS =
   /iPad|iPhone|iPod/i.test(navigator.userAgent || "") ||
   (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
-/* ---------- Shared AI audio player ---------- */
+/* ---------- Shared AI audio player + analyser ---------- */
 let ttsPlayer = null;
 let playbackAC = null;
 let playbackAnalyser = null;
 let playbackData = null;
 let audioUnlocked = false;
 
-/* ---------- Call SFX ---------- */
+/* Playback cancel hook (for barge-in + end call) */
+let cancelPlaybackNow = null;
+
+/* Abort controllers (for endCall safety) */
+let transcribeAbort = null;
+let coachAbort = null;
+
+/* ---------- Call SFX: ring.mp3 ---------- */
 let ringAudio = null;
 let ringPlayed = false;
 
@@ -121,12 +131,10 @@ function setStatus(t) {
   if (!statusText) return;
   statusText.textContent = t || "";
 }
-
 function setInterim(t) {
   if (!transcriptInterim) return;
   transcriptInterim.textContent = t || "";
 }
-
 function addFinalLine(t) {
   if (!transcriptList) return;
   const s = (t || "").trim();
@@ -140,12 +148,15 @@ function addFinalLine(t) {
 
   if (autoScroll) transcriptList.scrollTop = transcriptList.scrollHeight;
 }
-
 function clearTranscript() {
   if (transcriptList) transcriptList.innerHTML = "";
   setInterim("");
   lastFinalLine = "";
   mergedTranscriptBuffer = "";
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /* ---------- Buttons ---------- */
@@ -226,12 +237,13 @@ async function unlockAudioSystem() {
       await playbackAC.resume().catch(() => {});
     }
 
-    // Setup playback analyser for AI ring
+    // Setup playback analyser once (AI ring)
     if (!playbackAnalyser) {
       const src = playbackAC.createMediaElementSource(ttsPlayer);
       playbackAnalyser = playbackAC.createAnalyser();
       playbackAnalyser.fftSize = 1024;
       playbackData = new Uint8Array(playbackAnalyser.fftSize);
+
       src.connect(playbackAnalyser);
       playbackAnalyser.connect(playbackAC.destination);
     }
@@ -255,13 +267,13 @@ async function unlockAudioSystem() {
   }
 }
 
-/* ---------- ring.mp3 SFX ---------- */
+/* ---------- ring.mp3 SFX (plays ONCE) ---------- */
 function ensureRingSfx() {
   if (ringAudio) return ringAudio;
-  ringAudio = new Audio("ring.mp3"); // put ring.mp3 in /app/ or root same level as call.html
+  ringAudio = new Audio("ring.mp3"); // ensure this path is correct for your deploy
   ringAudio.preload = "auto";
   ringAudio.playsInline = true;
-  ringAudio.loop = true;
+  ringAudio.loop = false; // ✅ truly once
   ringAudio.volume = 0.65;
   return ringAudio;
 }
@@ -272,10 +284,11 @@ async function playRingOnceOnConnect() {
 
   try {
     const r = ensureRingSfx();
+    r.pause();
     r.currentTime = 0;
     r.muted = false;
     await r.play().catch(() => {});
-    log("🔔 ring started");
+    log("🔔 ring played");
   } catch {}
 }
 
@@ -284,21 +297,10 @@ function stopRing() {
     if (!ringAudio) return;
     ringAudio.pause();
     ringAudio.currentTime = 0;
-    log("🔕 ring stopped");
   } catch {}
 }
 
-/* ---------- VAD setup ---------- */
-async function ensureMicStream() {
-  if (globalStream) return globalStream;
-
-  globalStream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-  });
-
-  return globalStream;
-}
-
+/* ---------- MIME picking ---------- */
 function pickSupportedMime() {
   const candidates = [
     "audio/webm;codecs=opus",
@@ -312,6 +314,23 @@ function pickSupportedMime() {
   return "audio/webm";
 }
 
+/* ---------- Mic stream ---------- */
+async function ensureMicStream() {
+  if (globalStream) return globalStream;
+
+  globalStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+
+  // apply mute immediately if needed
+  try {
+    globalStream.getAudioTracks().forEach((t) => (t.enabled = !micMuted));
+  } catch {}
+
+  return globalStream;
+}
+
+/* ---------- VAD setup ---------- */
 async function setupVAD() {
   if (vadAC) return;
 
@@ -329,7 +348,12 @@ async function setupVAD() {
 
   vadSource.connect(vadAnalyser);
 
-  log("✅ VAD ready");
+  // reset adaptive stats
+  noiseFloor = 0.01;
+  noiseSamples = 0;
+  lastNoiseUpdate = performance.now();
+
+  log("✅ VAD ready (adaptive)");
 }
 
 function rmsFromTimeDomain(bytes) {
@@ -347,23 +371,67 @@ function getMicEnergy() {
   return rmsFromTimeDomain(vadData);
 }
 
+function computeAdaptiveThreshold() {
+  let thr = noiseFloor * THRESHOLD_MULTIPLIER;
+  if (!Number.isFinite(thr)) thr = 0.03;
+  thr = Math.max(THRESHOLD_MIN, Math.min(THRESHOLD_MAX, thr));
+  return thr;
+}
+
+function maybeUpdateNoiseFloor(energy, now) {
+  // update baseline only periodically and only while not speaking / not recording
+  if (now - lastNoiseUpdate < NOISE_FLOOR_UPDATE_MS) return;
+  lastNoiseUpdate = now;
+
+  // very simple EWMA-ish baseline:
+  // favor lower energies; ignore spikes
+  const capped = Math.min(energy, noiseFloor * 3 + 0.01);
+
+  if (noiseSamples < 1) {
+    noiseFloor = capped;
+    noiseSamples = 1;
+    return;
+  }
+
+  // slow drift so it adapts to room noise
+  const alpha = 0.10;
+  noiseFloor = noiseFloor * (1 - alpha) + capped * alpha;
+  noiseSamples += 1;
+
+  // clamp baseline
+  noiseFloor = Math.max(0.004, Math.min(0.05, noiseFloor));
+}
+
 /* ---------- BARGE-IN ---------- */
+function cancelAnyPlayback(reason = "cancel") {
+  try {
+    if (typeof cancelPlaybackNow === "function") {
+      cancelPlaybackNow(reason);
+    }
+  } catch {}
+  cancelPlaybackNow = null;
+}
+
 function stopAIPlaybackForBargeIn() {
   if (!ttsPlayer) return;
+  if (!isPlayingAI) return;
+
   try {
-    if (!isPlayingAI) return;
+    // cancel promise immediately
+    cancelAnyPlayback("barge_in");
+
     ttsPlayer.pause();
     ttsPlayer.currentTime = 0;
-    isPlayingAI = false;
-    setStatus("Listening…");
-    log("🛑 Barge-in: AI stopped");
   } catch {}
+
+  isPlayingAI = false;
+  setStatus("Listening…");
+  log("🛑 Barge-in: AI stopped");
 }
 
 /* ---------- RECORD TURN CONTROL ---------- */
 async function startRecordingTurn() {
   if (isRecording) return;
-
   const stream = await ensureMicStream();
   const mimeType = pickSupportedMime();
 
@@ -390,9 +458,10 @@ async function stopRecordingTurn() {
   } catch {}
 
   // wait stop
-  while (isRecording) {
-    await new Promise((r) => setTimeout(r, 30));
-  }
+  while (isRecording) await sleep(25);
+
+  // help GC / avoid weird reuse
+  mediaRecorder = null;
 }
 
 /* ---------- Transcribe audio -> text ---------- */
@@ -401,17 +470,24 @@ async function transcribeTurn() {
 
   setStatus("Transcribing…");
 
+  // abort previous transcribe if any (shouldn't overlap, but safe)
+  try { transcribeAbort?.abort(); } catch {}
+  transcribeAbort = new AbortController();
+
   try {
-    const mime = mediaRecorder?.mimeType || "audio/webm";
+    const mime = "audio/webm"; // your function forwards raw multipart; keep simple
     const blob = new Blob(recordChunks, { type: mime });
 
     const fd = new FormData();
-    fd.append("audio", blob, "user.webm");
-    fd.append("mime", mime);
+    fd.append("file", blob, "user.webm");         // ✅ OpenAI expects "file"
+    fd.append("model", TRANSCRIBE_MODEL);         // ✅ REQUIRED
+    fd.append("response_format", "json");         // optional but stable
+    // If you want: fd.append("language", "en");
 
     const resp = await fetch(TRANSCRIBE_ENDPOINT, {
       method: "POST",
       body: fd,
+      signal: transcribeAbort.signal,
     });
 
     if (!resp.ok) {
@@ -423,8 +499,11 @@ async function transcribeTurn() {
     const text = (data?.text || data?.transcript || data?.utterance || "").toString().trim();
     return text;
   } catch (e) {
+    if (e?.name === "AbortError") return "";
     warn("transcribeTurn error", e);
     return "";
+  } finally {
+    transcribeAbort = null;
   }
 }
 
@@ -432,7 +511,6 @@ async function transcribeTurn() {
 function queueMergedSend(transcript) {
   if (!transcript) return;
 
-  // Add to buffer
   mergedTranscriptBuffer = mergedTranscriptBuffer
     ? `${mergedTranscriptBuffer} ${transcript}`.trim()
     : transcript.trim();
@@ -442,11 +520,14 @@ function queueMergedSend(transcript) {
   if (mergeTimer) clearTimeout(mergeTimer);
 
   mergeTimer = setTimeout(async () => {
+    mergeTimer = null;
+
     const final = mergedTranscriptBuffer.trim();
     mergedTranscriptBuffer = "";
     setInterim("");
 
     if (!final) return;
+    if (!isCalling) return;
 
     addFinalLine("You: " + final);
     await sendTranscriptToCoachAndPlay(final);
@@ -457,13 +538,19 @@ function queueMergedSend(transcript) {
 async function sendTranscriptToCoachAndPlay(transcript) {
   const text = (transcript || "").trim();
   if (!text) return false;
+  if (!isCalling) return false;
 
   setStatus("Thinking…");
+
+  // abort previous coach request if somehow overlapping
+  try { coachAbort?.abort(); } catch {}
+  coachAbort = new AbortController();
 
   try {
     const resp = await fetch(CALL_COACH_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: coachAbort.signal,
       body: JSON.stringify({
         source: "voice",
         conversationId: conversationId || null,
@@ -479,6 +566,8 @@ async function sendTranscriptToCoachAndPlay(transcript) {
     }
 
     const data = await resp.json().catch(() => ({}));
+    if (!isCalling) return false;
+
     const replyText = (data?.assistant_text || data?.text || "").trim();
     if (replyText) addFinalLine("AI: " + replyText);
 
@@ -495,6 +584,9 @@ async function sendTranscriptToCoachAndPlay(transcript) {
       return true;
     }
 
+    // Ensure ring never overlaps AI speaking
+    stopRing();
+
     // Play AI
     isPlayingAI = true;
     setStatus("AI replying…");
@@ -502,65 +594,70 @@ async function sendTranscriptToCoachAndPlay(transcript) {
     const ok = await playViaSharedPlayerFromBase64(b64, mime);
 
     isPlayingAI = false;
-    setStatus("Listening…");
+    if (!isCalling) return ok;
 
+    setStatus("Listening…");
     return ok;
   } catch (e) {
+    if (e?.name === "AbortError") return false;
     warn("sendTranscriptToCoachAndPlay error", e);
     isPlayingAI = false;
-    setStatus("Network error.");
+    if (isCalling) setStatus("Network error.");
     return false;
+  } finally {
+    coachAbort = null;
   }
 }
 
-/* ---------- Playback base64 + AI ring sync ---------- */
+/* ---------- Playback base64 + AI ring sync + cancelable ---------- */
 function playViaSharedPlayerFromBase64(b64, mime = "audio/mpeg", limitMs = 30000) {
   return new Promise((resolve) => {
     const a = ensureSharedAudio();
     let done = false;
 
+    const blobUrl = (() => {
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: mime });
+      return URL.createObjectURL(blob);
+    })();
+
+    const cleanup = () => {
+      try { URL.revokeObjectURL(blobUrl); } catch {}
+      a.onended = a.onerror = a.onabort = null;
+      cancelPlaybackNow = null;
+    };
+
     const settle = (ok) => {
       if (done) return;
       done = true;
-      a.onended = a.onerror = a.onabort = null;
+      cleanup();
       resolve(ok);
     };
 
-    try {
-      a.pause();
-    } catch {}
+    // expose cancel hook (barge-in/endCall)
+    cancelPlaybackNow = () => {
+      try { a.pause(); } catch {}
+      try { a.currentTime = 0; } catch {}
+      settle(true);
+    };
 
-    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-    const blob = new Blob([bytes], { type: mime });
-    const url = URL.createObjectURL(blob);
-
-    a.src = url;
+    try { a.pause(); } catch {}
+    a.src = blobUrl;
     a.muted = speakerMuted;
     a.volume = speakerMuted ? 0 : 1;
 
-    a.onerror = () => {
-      URL.revokeObjectURL(url);
-      settle(false);
-    };
-    a.onabort = () => {
-      URL.revokeObjectURL(url);
-      settle(false);
-    };
+    a.onerror = () => settle(false);
+    a.onabort = () => settle(false);
 
-    const t = setTimeout(() => {
-      URL.revokeObjectURL(url);
-      settle(false);
-    }, limitMs);
+    const t = setTimeout(() => settle(false), limitMs);
 
     a.onended = () => {
       clearTimeout(t);
-      URL.revokeObjectURL(url);
       settle(true);
     };
 
     a.play().catch(() => {
       clearTimeout(t);
-      URL.revokeObjectURL(url);
       settle(false);
     });
   });
@@ -587,8 +684,7 @@ function resizeRing() {
 function getAILevel() {
   if (!playbackAnalyser || !playbackData) return 0;
   playbackAnalyser.getByteTimeDomainData(playbackData);
-  const rms = rmsFromTimeDomain(playbackData);
-  return rms;
+  return rmsFromTimeDomain(playbackData);
 }
 
 function drawRings() {
@@ -603,15 +699,12 @@ function drawRings() {
 
   const t = performance.now() / 1000;
 
-  // Levels
-  const micLevel = getMicEnergy(); // 0..~0.1
-  const aiLevel = getAILevel();    // 0..~0.1
+  const micLevel = getMicEnergy();
+  const aiLevel = getAILevel();
 
-  // Premium shaping
   const micAmp = Math.min(1, micLevel / 0.12);
   const aiAmp = Math.min(1, aiLevel / 0.12);
 
-  // Base radius
   const baseR = Math.min(w, h) * 0.32;
 
   // USER ring
@@ -627,11 +720,9 @@ function drawRings() {
 
 function drawGlowRing(cx, cy, r, amp, isUser) {
   const ctx = ringCtx;
-
   const glow = 12 + amp * 22;
   const line = 6 + amp * 6;
 
-  // Gradient
   const g = ctx.createRadialGradient(cx, cy, r - 20, cx, cy, r + 40);
   if (isUser) {
     g.addColorStop(0, `rgba(120, 170, 255, ${0.15 + amp * 0.35})`);
@@ -657,7 +748,6 @@ function drawGlowRing(cx, cy, r, amp, isUser) {
 
   ctx.stroke();
 
-  // Soft outer aura
   ctx.shadowBlur = 0;
   ctx.strokeStyle = g;
   ctx.lineWidth = line * 2.2;
@@ -672,10 +762,9 @@ async function startVADLoop() {
   if (vadLoopRunning) return;
   vadLoopRunning = true;
 
-  lastVoiceTime = performance.now();
-  speechDetected = false;
   vadState = "idle";
-  currentSpeechStartedAt = 0;
+  lastVoiceTime = performance.now();
+  speechStartTime = 0;
 
   setStatus("Listening…");
   setInterim("");
@@ -686,40 +775,37 @@ async function startVADLoop() {
       return;
     }
 
-    // If mic muted, stay idle
-    if (micMuted) {
-      setInterim("Mic is muted…");
-      requestAnimationFrame(loop);
-      return;
-    }
-
+    // If mic muted, stay idle but keep sampling noise floor lightly
     const energy = getMicEnergy();
     const now = performance.now();
 
-    const isVoice = energy > VAD_THRESHOLD;
+    if (vadState === "idle" && !micMuted) {
+      maybeUpdateNoiseFloor(energy, now);
+    }
 
-    // Barge-in: if AI speaking and user starts talking
+    const threshold = computeAdaptiveThreshold();
+    const isVoice = !micMuted && energy > threshold;
+
+    // Barge-in
     if (isVoice && isPlayingAI) {
       stopAIPlaybackForBargeIn();
     }
 
     if (vadState === "idle") {
-      // waiting for speech start
       if (isVoice) {
         vadState = "speaking";
-        currentSpeechStartedAt = now;
+        speechStartTime = now;
         lastVoiceTime = now;
-        speechDetected = true;
 
         stopRing(); // stop ring once user begins speaking
         await startRecordingTurn();
+        if (!isCalling) { vadLoopRunning = false; return; }
 
         setStatus("Listening…");
         setInterim("Speaking…");
       } else {
-        // idle timeout fallback
+        // keep alive
         if (now - lastVoiceTime > VAD_IDLE_TIMEOUT_MS) {
-          // stay idle but keep loop alive
           lastVoiceTime = now;
         }
       }
@@ -728,30 +814,27 @@ async function startVADLoop() {
         lastVoiceTime = now;
         setInterim("Speaking…");
       } else {
-        // silence detected
         const silenceFor = now - lastVoiceTime;
-        const speechLen = now - currentSpeechStartedAt;
-
+        const speechLen = now - speechStartTime;
         setInterim("…");
 
         if (silenceFor >= VAD_SILENCE_MS) {
-          // End turn
           vadState = "idle";
           setInterim("");
 
+          await stopRecordingTurn();
+          if (!isCalling) { vadLoopRunning = false; return; }
+
           if (speechLen < VAD_MIN_SPEECH_MS) {
-            // ignore tiny noise
-            await stopRecordingTurn();
             recordChunks = [];
             setStatus("Listening…");
           } else {
-            await stopRecordingTurn();
             const transcript = await transcribeTurn();
+            if (!isCalling) { vadLoopRunning = false; return; }
 
             if (!transcript) {
               setStatus("Didn’t catch that. Try again…");
             } else {
-              // MERGE: queue transcript into merge buffer
               queueMergedSend(transcript);
             }
           }
@@ -769,7 +852,7 @@ async function startVADLoop() {
 
 /* ---------- Call controls ---------- */
 callBtn?.addEventListener("click", async () => {
-  await unlockAudioSystem();  // user gesture unlock
+  await unlockAudioSystem(); // user gesture unlock
   if (!isCalling) startCall();
   else endCall();
 });
@@ -779,11 +862,18 @@ async function startCall() {
   clearTranscript();
   setStatus("Connecting…");
 
+  // reset controllers/timers
+  try { transcribeAbort?.abort(); } catch {}
+  try { coachAbort?.abort(); } catch {}
+  transcribeAbort = null;
+  coachAbort = null;
+
   ringPlayed = false;
   await playRingOnceOnConnect();
 
   try {
     await setupVAD();
+    if (!voiceRing) warn("voiceRing canvas not found — rings disabled");
     setupRingCanvas();
     if (!ringRAF) drawRings();
 
@@ -799,27 +889,47 @@ async function startCall() {
 function endCall() {
   isCalling = false;
 
-  stopRing();
-
+  // stop merge
   try {
     if (mergeTimer) clearTimeout(mergeTimer);
   } catch {}
+  mergeTimer = null;
+  mergedTranscriptBuffer = "";
 
+  // abort network
+  try { transcribeAbort?.abort(); } catch {}
+  try { coachAbort?.abort(); } catch {}
+  transcribeAbort = null;
+  coachAbort = null;
+
+  // stop ring sfx
+  stopRing();
+
+  // stop recording
   try {
     if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
   } catch {}
+  mediaRecorder = null;
+  isRecording = false;
+  recordChunks = [];
 
+  // stop mic stream
   try {
     globalStream?.getTracks().forEach((t) => t.stop());
   } catch {}
   globalStream = null;
 
+  // stop AI playback (and resolve promise)
+  try {
+    cancelAnyPlayback("end_call");
+  } catch {}
   try {
     if (ttsPlayer) {
       ttsPlayer.pause();
       ttsPlayer.currentTime = 0;
     }
   } catch {}
+  isPlayingAI = false;
 
   setStatus("Call ended.");
   setInterim("");
@@ -828,4 +938,4 @@ function endCall() {
 /* ---------- Boot ---------- */
 ensureSharedAudio();
 setStatus("Tap the blue call button to begin.");
-log("✅ call.js loaded: FREE TALK + VAD + MERGE + BARGE-IN + RING + PREMIUM RINGS");
+log("✅ call.js loaded: FREE TALK + ADAPTIVE VAD + MERGE + BARGE-IN + RING + PREMIUM RINGS");
