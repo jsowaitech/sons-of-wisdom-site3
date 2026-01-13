@@ -6,12 +6,12 @@
 //    - /.netlify/functions/call-coach         (transcript -> AI text + TTS audio)
 //
 // ✅ Fixes applied in this version:
-//    1) Transcription now includes required form-data fields: model (+ optional response_format)
-//    2) Barge-in now CANCELS playback promise immediately (no hanging until timeout)
-//    3) End Call now aborts in-flight fetches + cancels merge timers + cancels playback cleanly
-//    4) VAD now uses ADAPTIVE noise floor (works across devices / noisy mics better)
-//    5) ring.mp3 now truly "plays once" (no loop). Also never overlaps with AI playback.
-//    6) Guards after awaits: nothing continues if call ended mid-transcribe/mid-coach
+//    1) Transcription includes required form-data fields: model (+ optional response_format)
+//    2) Playback is now SINGLE-FLIGHT (prevents “plays one, skips one”)
+//    3) Barge-in cancels playback without corrupting the next clip
+//    4) End Call aborts in-flight fetches + cancels merge + cancels playback cleanly
+//    5) VAD uses ADAPTIVE noise floor
+//    6) ring.mp3 plays once and never overlaps with AI playback
 //
 // ✅ UI rings:
 //    - User ring reacts to mic energy
@@ -30,7 +30,6 @@ const CALL_COACH_ENDPOINT = "/.netlify/functions/call-coach";
 const TRANSCRIBE_ENDPOINT = "/.netlify/functions/openai-transcribe";
 
 /* ---------- TRANSCRIBE MODEL (IMPORTANT) ---------- */
-// Prefer the new transcribe model; fallback to whisper-1 if you want.
 const TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
 // const TRANSCRIBE_MODEL = "whisper-1";
 
@@ -87,21 +86,21 @@ let lastVoiceTime = 0;
 let speechStartTime = 0;
 
 /* Adaptive noise floor */
-let noiseFloor = 0.01;           // baseline RMS
+let noiseFloor = 0.01;
 let noiseSamples = 0;
 let lastNoiseUpdate = 0;
 
-/* VAD tuning (adaptive) */
-const VAD_SILENCE_MS = 850;       // silence duration that ends turn
-const VAD_MERGE_WINDOW_MS = 1100; // pause window for merging
-const VAD_MIN_SPEECH_MS = 260;    // ignore tiny blips
+/* VAD tuning */
+const VAD_SILENCE_MS = 850;
+const VAD_MERGE_WINDOW_MS = 1100;
+const VAD_MIN_SPEECH_MS = 260;
 const VAD_IDLE_TIMEOUT_MS = 25000;
 
 /* Adaptive threshold shaping */
-const NOISE_FLOOR_UPDATE_MS = 250;   // how often we refine baseline
-const THRESHOLD_MULTIPLIER = 2.2;    // baseline * multiplier => "voice"
-const THRESHOLD_MIN = 0.018;         // never go below this
-const THRESHOLD_MAX = 0.085;         // never go above this
+const NOISE_FLOOR_UPDATE_MS = 250;
+const THRESHOLD_MULTIPLIER = 2.2;
+const THRESHOLD_MIN = 0.018;
+const THRESHOLD_MAX = 0.085;
 
 /* ---------- iOS detection ---------- */
 const IS_IOS =
@@ -115,8 +114,29 @@ let playbackAnalyser = null;
 let playbackData = null;
 let audioUnlocked = false;
 
-/* Playback cancel hook (for barge-in + end call) */
-let cancelPlaybackNow = null;
+/* ---------- SINGLE-FLIGHT PLAYBACK ENGINE ---------- */
+let playbackSeq = 0;       // increments per play/stop
+let playbackUrl = null;    // current blob URL
+let playbackTimer = null;  // current timeout
+
+function cleanupPlayback() {
+  try {
+    if (playbackTimer) clearTimeout(playbackTimer);
+  } catch {}
+  playbackTimer = null;
+
+  try {
+    const a = ensureSharedAudio();
+    a.onended = null;
+    a.onerror = null;
+    a.onabort = null;
+  } catch {}
+
+  try {
+    if (playbackUrl) URL.revokeObjectURL(playbackUrl);
+  } catch {}
+  playbackUrl = null;
+}
 
 /* Abort controllers (for endCall safety) */
 let transcribeAbort = null;
@@ -270,10 +290,10 @@ async function unlockAudioSystem() {
 /* ---------- ring.mp3 SFX (plays ONCE) ---------- */
 function ensureRingSfx() {
   if (ringAudio) return ringAudio;
-  ringAudio = new Audio("ring.mp3"); // ensure this path is correct for your deploy
+  ringAudio = new Audio("ring.mp3");
   ringAudio.preload = "auto";
   ringAudio.playsInline = true;
-  ringAudio.loop = false; // ✅ truly once
+  ringAudio.loop = false;
   ringAudio.volume = 0.65;
   return ringAudio;
 }
@@ -322,7 +342,6 @@ async function ensureMicStream() {
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
   });
 
-  // apply mute immediately if needed
   try {
     globalStream.getAudioTracks().forEach((t) => (t.enabled = !micMuted));
   } catch {}
@@ -348,7 +367,6 @@ async function setupVAD() {
 
   vadSource.connect(vadAnalyser);
 
-  // reset adaptive stats
   noiseFloor = 0.01;
   noiseSamples = 0;
   lastNoiseUpdate = performance.now();
@@ -379,12 +397,9 @@ function computeAdaptiveThreshold() {
 }
 
 function maybeUpdateNoiseFloor(energy, now) {
-  // update baseline only periodically and only while not speaking / not recording
   if (now - lastNoiseUpdate < NOISE_FLOOR_UPDATE_MS) return;
   lastNoiseUpdate = now;
 
-  // very simple EWMA-ish baseline:
-  // favor lower energies; ignore spikes
   const capped = Math.min(energy, noiseFloor * 3 + 0.01);
 
   if (noiseSamples < 1) {
@@ -393,34 +408,25 @@ function maybeUpdateNoiseFloor(energy, now) {
     return;
   }
 
-  // slow drift so it adapts to room noise
   const alpha = 0.10;
   noiseFloor = noiseFloor * (1 - alpha) + capped * alpha;
   noiseSamples += 1;
 
-  // clamp baseline
   noiseFloor = Math.max(0.004, Math.min(0.05, noiseFloor));
 }
 
 /* ---------- BARGE-IN ---------- */
-function cancelAnyPlayback(reason = "cancel") {
-  try {
-    if (typeof cancelPlaybackNow === "function") {
-      cancelPlaybackNow(reason);
-    }
-  } catch {}
-  cancelPlaybackNow = null;
-}
-
 function stopAIPlaybackForBargeIn() {
   if (!ttsPlayer) return;
   if (!isPlayingAI) return;
 
   try {
-    // cancel promise immediately
-    cancelAnyPlayback("barge_in");
+    // invalidate any in-flight playback
+    playbackSeq++;
+    cleanupPlayback();
 
     ttsPlayer.pause();
+    ttsPlayer.src = "";
     ttsPlayer.currentTime = 0;
   } catch {}
 
@@ -432,6 +438,7 @@ function stopAIPlaybackForBargeIn() {
 /* ---------- RECORD TURN CONTROL ---------- */
 async function startRecordingTurn() {
   if (isRecording) return;
+
   const stream = await ensureMicStream();
   const mimeType = pickSupportedMime();
 
@@ -457,10 +464,8 @@ async function stopRecordingTurn() {
     if (mediaRecorder.state !== "inactive") mediaRecorder.stop();
   } catch {}
 
-  // wait stop
   while (isRecording) await sleep(25);
 
-  // help GC / avoid weird reuse
   mediaRecorder = null;
 }
 
@@ -470,19 +475,17 @@ async function transcribeTurn() {
 
   setStatus("Transcribing…");
 
-  // abort previous transcribe if any (shouldn't overlap, but safe)
   try { transcribeAbort?.abort(); } catch {}
   transcribeAbort = new AbortController();
 
   try {
-    const mime = "audio/webm"; // your function forwards raw multipart; keep simple
+    const mime = mediaRecorder?.mimeType || recordChunks?.[0]?.type || "audio/webm";
     const blob = new Blob(recordChunks, { type: mime });
 
     const fd = new FormData();
-    fd.append("file", blob, "user.webm");         // ✅ OpenAI expects "file"
-    fd.append("model", TRANSCRIBE_MODEL);         // ✅ REQUIRED
-    fd.append("response_format", "json");         // optional but stable
-    // If you want: fd.append("language", "en");
+    fd.append("file", blob, "user.webm");
+    fd.append("model", TRANSCRIBE_MODEL);
+    fd.append("response_format", "json");
 
     const resp = await fetch(TRANSCRIBE_ENDPOINT, {
       method: "POST",
@@ -496,8 +499,7 @@ async function transcribeTurn() {
     }
 
     const data = await resp.json().catch(() => ({}));
-    const text = (data?.text || data?.transcript || data?.utterance || "").toString().trim();
-    return text;
+    return (data?.text || data?.transcript || data?.utterance || "").toString().trim();
   } catch (e) {
     if (e?.name === "AbortError") return "";
     warn("transcribeTurn error", e);
@@ -542,7 +544,6 @@ async function sendTranscriptToCoachAndPlay(transcript) {
 
   setStatus("Thinking…");
 
-  // abort previous coach request if somehow overlapping
   try { coachAbort?.abort(); } catch {}
   coachAbort = new AbortController();
 
@@ -584,10 +585,12 @@ async function sendTranscriptToCoachAndPlay(transcript) {
       return true;
     }
 
-    // Ensure ring never overlaps AI speaking
+    // ensure ring never overlaps AI speaking
     stopRing();
 
-    // Play AI
+    // extra safety: don't overlap AI clips
+    if (isPlayingAI) stopAIPlaybackForBargeIn();
+
     isPlayingAI = true;
     setStatus("AI replying…");
 
@@ -609,57 +612,51 @@ async function sendTranscriptToCoachAndPlay(transcript) {
   }
 }
 
-/* ---------- Playback base64 + AI ring sync + cancelable ---------- */
-function playViaSharedPlayerFromBase64(b64, mime = "audio/mpeg", limitMs = 30000) {
+/* ---------- Playback base64 (SINGLE-FLIGHT, sequence-locked) ---------- */
+function playViaSharedPlayerFromBase64(b64, mime = "audio/mpeg", limitMs = 45000) {
+  const a = ensureSharedAudio();
+
+  // create a unique session id
+  const seq = ++playbackSeq;
+
+  // kill anything previously in-flight
+  cleanupPlayback();
+
   return new Promise((resolve) => {
-    const a = ensureSharedAudio();
     let done = false;
 
-    const blobUrl = (() => {
-      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-      const blob = new Blob([bytes], { type: mime });
-      return URL.createObjectURL(blob);
-    })();
-
-    const cleanup = () => {
-      try { URL.revokeObjectURL(blobUrl); } catch {}
-      a.onended = a.onerror = a.onabort = null;
-      cancelPlaybackNow = null;
-    };
-
     const settle = (ok) => {
+      if (seq !== playbackSeq) return; // only newest session can settle
       if (done) return;
       done = true;
-      cleanup();
+      cleanupPlayback();
       resolve(ok);
     };
 
-    // expose cancel hook (barge-in/endCall)
-    cancelPlaybackNow = () => {
-      try { a.pause(); } catch {}
-      try { a.currentTime = 0; } catch {}
-      settle(true);
-    };
+    try {
+      a.pause();
+      a.currentTime = 0;
+    } catch {}
 
-    try { a.pause(); } catch {}
-    a.src = blobUrl;
-    a.muted = speakerMuted;
-    a.volume = speakerMuted ? 0 : 1;
+    try {
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: mime });
+      playbackUrl = URL.createObjectURL(blob);
 
-    a.onerror = () => settle(false);
-    a.onabort = () => settle(false);
+      a.src = playbackUrl;
+      a.muted = speakerMuted;
+      a.volume = speakerMuted ? 0 : 1;
 
-    const t = setTimeout(() => settle(false), limitMs);
+      a.onerror = () => settle(false);
+      a.onabort = () => settle(false);
+      a.onended = () => settle(true);
 
-    a.onended = () => {
-      clearTimeout(t);
-      settle(true);
-    };
+      playbackTimer = setTimeout(() => settle(false), limitMs);
 
-    a.play().catch(() => {
-      clearTimeout(t);
+      a.play().catch(() => settle(false));
+    } catch {
       settle(false);
-    });
+    }
   });
 }
 
@@ -775,7 +772,6 @@ async function startVADLoop() {
       return;
     }
 
-    // If mic muted, stay idle but keep sampling noise floor lightly
     const energy = getMicEnergy();
     const now = performance.now();
 
@@ -797,14 +793,13 @@ async function startVADLoop() {
         speechStartTime = now;
         lastVoiceTime = now;
 
-        stopRing(); // stop ring once user begins speaking
+        stopRing();
         await startRecordingTurn();
         if (!isCalling) { vadLoopRunning = false; return; }
 
         setStatus("Listening…");
         setInterim("Speaking…");
       } else {
-        // keep alive
         if (now - lastVoiceTime > VAD_IDLE_TIMEOUT_MS) {
           lastVoiceTime = now;
         }
@@ -852,7 +847,7 @@ async function startVADLoop() {
 
 /* ---------- Call controls ---------- */
 callBtn?.addEventListener("click", async () => {
-  await unlockAudioSystem(); // user gesture unlock
+  await unlockAudioSystem();
   if (!isCalling) startCall();
   else endCall();
 });
@@ -862,7 +857,6 @@ async function startCall() {
   clearTranscript();
   setStatus("Connecting…");
 
-  // reset controllers/timers
   try { transcribeAbort?.abort(); } catch {}
   try { coachAbort?.abort(); } catch {}
   transcribeAbort = null;
@@ -890,9 +884,7 @@ function endCall() {
   isCalling = false;
 
   // stop merge
-  try {
-    if (mergeTimer) clearTimeout(mergeTimer);
-  } catch {}
+  try { if (mergeTimer) clearTimeout(mergeTimer); } catch {}
   mergeTimer = null;
   mergedTranscriptBuffer = "";
 
@@ -919,13 +911,13 @@ function endCall() {
   } catch {}
   globalStream = null;
 
-  // stop AI playback (and resolve promise)
+  // stop AI playback (single-flight safe)
   try {
-    cancelAnyPlayback("end_call");
-  } catch {}
-  try {
+    playbackSeq++; // invalidate any in-flight settle
+    cleanupPlayback();
     if (ttsPlayer) {
       ttsPlayer.pause();
+      ttsPlayer.src = "";
       ttsPlayer.currentTime = 0;
     }
   } catch {}
