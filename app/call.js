@@ -1,11 +1,13 @@
 // app/call.js
 // Son of Wisdom — Call mode (Phone-call pace + iOS-safe layout + reliable audio queue)
-// Updated:
-// - Rename "Speaker" toggle to "Audio" (accurate for iPhone/AirPods routing)
-// - Status rendering: never claim "Speaker muted"; show "Audio muted" instead
-// - Keep TTS queued while audio muted; drain on unmute
-// - Preserve existing: single renderStatus, correct recorder MIME for transcription,
-//   close AudioContexts on endCall, reset VAD/merge state on background.
+// Updated: status-race fix (single renderStatus), correct recorder MIME for transcription,
+// keep TTS queued while speaker muted, close AudioContexts on endCall,
+// and reset VAD/merge state on background.
+//
+// UPDATE (REMOVE AUDIO RESUME OVERLAY):
+// ✅ Removes the full-screen “Audio paused / Tap to resume” overlay entirely
+// ✅ No overlay DOM refs, no overlay status branch, no overlay show/hide calls
+// ✅ If iOS blocks playback anyway, we just fail the playback attempt gracefully
 
 const DEBUG = true;
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -27,7 +29,7 @@ const conversationId = urlParams.get("c") || null;
 const callBtn = document.getElementById("call-btn");
 const statusText = document.getElementById("status-text");
 const micBtn = document.getElementById("mic-btn");
-const speakerBtn = document.getElementById("speaker-btn"); // (kept id)
+const speakerBtn = document.getElementById("speaker-btn");
 const modeBtn = document.getElementById("mode-btn");
 
 const transcriptList = document.getElementById("transcriptList");
@@ -40,9 +42,6 @@ const voiceRing = document.getElementById("voiceRing");
 const callTimerEl = document.getElementById("call-timer");
 const callLabelEl = document.getElementById("call-label");
 
-const audioResumeOverlay = document.getElementById("audio-resume-overlay");
-const audioResumeBtn = document.getElementById("audio-resume-btn");
-
 const debugEl = document.getElementById("call-debug");
 
 /* ---------- STATE ---------- */
@@ -50,10 +49,7 @@ let isCalling = false;
 let isRecording = false;
 
 let micMuted = false;
-
-// IMPORTANT: This is NOT the iPhone "speaker route".
-// It's simply whether the web app is allowed to play audio (whatever route iOS chooses).
-let audioMuted = false;
+let speakerMuted = false;
 
 let autoScroll = true;
 let lastFinalLine = "";
@@ -178,7 +174,7 @@ function setTransientStatus(t, ms = 1600) {
 }
 
 function renderStatus() {
-  // Priority order: paused > resume overlay hint > AI speaking > transcribing > thinking > merging > transient > mic muted > audio muted > default
+  // Priority order: paused > AI speaking > transcribing > thinking > merging > transient > mic muted > default
   if (!isCalling) {
     setStatus("Tap the blue call button to begin.");
     return;
@@ -189,15 +185,8 @@ function renderStatus() {
     return;
   }
 
-  // If Safari blocked playback, overlay will show; keep status helpful.
-  if (!audioResumeOverlay?.hidden) {
-    setStatus("Tap to resume audio.");
-    return;
-  }
-
-  // AI speaking status should win even if audioMuted (still accurate: AI is replying).
-  if (isPlayingAI) {
-    setStatus(audioMuted ? "AI replying… (audio muted)" : "AI replying…");
+  if (isPlayingAI && !speakerMuted) {
+    setStatus("AI replying…");
     return;
   }
 
@@ -224,11 +213,6 @@ function renderStatus() {
 
   if (micMuted) {
     setStatus("Mic muted.");
-    return;
-  }
-
-  if (audioMuted) {
-    setStatus("Audio muted.");
     return;
   }
 
@@ -269,18 +253,6 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function showAudioResumeOverlay() {
-  if (!audioResumeOverlay) return;
-  audioResumeOverlay.hidden = false;
-  renderStatus();
-}
-
-function hideAudioResumeOverlay() {
-  if (!audioResumeOverlay) return;
-  audioResumeOverlay.hidden = true;
-  renderStatus();
-}
-
 function setDebugText(t) {
   if (!debugEl) return;
   debugEl.textContent = t || "";
@@ -313,36 +285,24 @@ micBtn?.addEventListener("click", () => {
   renderStatus();
 });
 
-function setAudioMutedUI(muted) {
-  audioMuted = !!muted;
+speakerBtn?.addEventListener("click", () => {
+  speakerMuted = !speakerMuted;
 
-  // Convention: aria-pressed="true" means "muted"
-  speakerBtn?.setAttribute("aria-pressed", String(audioMuted));
+  // NOTE: In HTML you may want aria-pressed to represent "muted". This keeps it consistent with mic.
+  speakerBtn?.setAttribute("aria-pressed", String(speakerMuted));
 
   if (ttsPlayer) {
-    ttsPlayer.muted = audioMuted;
-    ttsPlayer.volume = audioMuted ? 0 : 1;
+    ttsPlayer.muted = speakerMuted;
+    ttsPlayer.volume = speakerMuted ? 0 : 1;
   }
 
   const lbl = document.getElementById("speaker-label");
-  if (lbl) lbl.textContent = audioMuted ? "Audio Off" : "Audio";
+  if (lbl) lbl.textContent = speakerMuted ? "Speaker Off" : "Speaker";
 
   // If unmuting, resume draining queued TTS
-  if (!audioMuted) drainTTSQueue();
+  if (!speakerMuted) drainTTSQueue();
 
   renderStatus();
-}
-
-speakerBtn?.addEventListener("click", () => {
-  setAudioMutedUI(!audioMuted);
-});
-
-audioResumeBtn?.addEventListener("click", async () => {
-  hideAudioResumeOverlay();
-  await unlockAudioSystem();
-  try {
-    if (ttsPlayer && !audioMuted) await ttsPlayer.play().catch(() => {});
-  } catch {}
 });
 
 /* Debug toggle + quick key to chat */
@@ -407,8 +367,8 @@ function ensureSharedAudio() {
   ttsPlayer.preload = "auto";
   ttsPlayer.playsInline = true;
   ttsPlayer.crossOrigin = "anonymous";
-  ttsPlayer.muted = audioMuted;
-  ttsPlayer.volume = audioMuted ? 0 : 1;
+  ttsPlayer.muted = speakerMuted;
+  ttsPlayer.volume = speakerMuted ? 0 : 1;
 
   return ttsPlayer;
 }
@@ -724,8 +684,8 @@ async function enqueueTTS(base64, mime) {
   if (!base64) return;
   ttsQueue.push({ base64, mime: mime || "audio/mpeg" });
 
-  // Only drain if audio is on; if muted, we keep queued for later.
-  if (!audioMuted) drainTTSQueue();
+  // Only drain if speaker is on; if muted, we keep queued for later.
+  if (!speakerMuted) drainTTSQueue();
 }
 
 async function drainTTSQueue() {
@@ -733,7 +693,7 @@ async function drainTTSQueue() {
   ttsDraining = true;
 
   try {
-    while (isCalling && ttsQueue.length && !audioMuted) {
+    while (isCalling && ttsQueue.length && !speakerMuted) {
       const item = ttsQueue.shift();
       if (!item?.base64) continue;
 
@@ -750,10 +710,10 @@ async function drainTTSQueue() {
       if (!isCalling) break;
 
       if (!ok) {
-        // If playback failed due to gesture lock, overlay is shown by player.
+        // Without overlay: just hint briefly and keep going.
+        setTransientStatus("Audio blocked. Tap Call again.", 1800);
         renderStatus();
       } else {
-        hideAudioResumeOverlay();
         renderStatus();
       }
     }
@@ -789,8 +749,8 @@ async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) 
   try { a.src = ""; } catch {}
   try { a.load(); } catch {}
 
-  a.muted = audioMuted;
-  a.volume = audioMuted ? 0 : 1;
+  a.muted = speakerMuted;
+  a.volume = speakerMuted ? 0 : 1;
   a.playsInline = true;
 
   const dataUrl = `data:${mime};base64,${b64}`;
@@ -848,7 +808,6 @@ async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) 
 
     a.onended = () => {
       if (myEpoch !== playbackEpoch) return;
-      hideAudioResumeOverlay();
       settle(true);
     };
     a.onerror = () => {
@@ -860,15 +819,10 @@ async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) 
       settle(false);
     };
 
-    a.play()
-      .then(() => {
-        hideAudioResumeOverlay();
-      })
-      .catch(() => {
-        // Safari gesture lock / audio lost unlock
-        showAudioResumeOverlay();
-        settle(false);
-      });
+    a.play().catch(() => {
+      // iOS can still block playback sometimes; no overlay, just fail gracefully.
+      settle(false);
+    });
   });
 }
 
@@ -909,7 +863,7 @@ async function playGreetingOnce() {
     if (b64) await enqueueTTS(b64, mime);
 
     // ensure greeting plays BEFORE listening begins
-    if (!audioMuted) await drainTTSQueue();
+    if (!speakerMuted) await drainTTSQueue();
 
     renderStatus();
   } catch (e) {
@@ -1031,9 +985,9 @@ async function startVADLoop() {
     const startThr = thr * VAD_START_MULT;
     const contThr = thr * VAD_CONT_MULT;
 
-    // If AI is speaking and audio is ON, do NOT start recording from echo.
+    // If AI is speaking and speaker is ON, do NOT start recording from echo.
     // We only allow a barge-in if voice is sustained and clearly louder than threshold.
-    const allowVADStart = !(isPlayingAI && !audioMuted);
+    const allowVADStart = !(isPlayingAI && !speakerMuted);
 
     if (vadState === "idle" && !micMuted) {
       if (allowVADStart) maybeUpdateNoiseFloor(energy, now);
@@ -1111,7 +1065,7 @@ async function startVADLoop() {
     if (debugOn) {
       setDebugText(
         `state=${vadState}  calling=${isCalling}  rec=${isRecording}\n` +
-        `AI=${isPlayingAI}  micMuted=${micMuted}  audioMuted=${audioMuted}\n` +
+        `AI=${isPlayingAI}  micMuted=${micMuted}  spkMuted=${speakerMuted}\n` +
         `energy=${energy.toFixed(4)}  noise=${noiseFloor.toFixed(4)}  thr=${thr.toFixed(4)}\n` +
         `turnQ=${pendingUserTurns.length}  ttsQ=${ttsQueue.length}  epoch=${playbackEpoch}`
       );
@@ -1260,7 +1214,6 @@ callBtn?.addEventListener("click", async () => {
 async function startCall() {
   isCalling = true;
   pausedInBackground = false;
-  hideAudioResumeOverlay();
   clearTranscript();
 
   callBtn?.classList.add("call-active");
@@ -1329,7 +1282,6 @@ function closeAudioContexts() {
 function endCall() {
   isCalling = false;
   pausedInBackground = false;
-  hideAudioResumeOverlay();
 
   callBtn?.classList.remove("call-active");
   callBtn?.setAttribute("aria-pressed", "false");
@@ -1385,6 +1337,5 @@ function endCall() {
 
 /* ---------- Boot ---------- */
 ensureSharedAudio();
-setAudioMutedUI(audioMuted); // ensure label/icon matches initial state
 renderStatus();
-log("✅ call.js loaded: AUDIO TOGGLE (iPhone/AirPods-safe) + STATUS FIXES + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + iOS RESUME OVERLAY + DEBUG HUD (D)");
+log("✅ call.js loaded: OVERLAY REMOVED + STATUS RENDER FIX + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)");
