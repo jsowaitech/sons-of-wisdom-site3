@@ -313,6 +313,44 @@ button:hover:not(:disabled),
 }
 
 /* =========================================================
+   AUTH STATUS PROMINENCE (finish-signup + auth)
+   Makes "check your email" / confirmation messages POP
+   ========================================================= */
+
+.status-line.auth-status {
+  font-size: 1.05rem;            /* bigger */
+  font-weight: 800;              /* bolder */
+  line-height: 1.35;
+  letter-spacing: 0.01em;
+
+  color: rgba(255, 255, 255, 0.98); /* bright white */
+
+  margin-top: 0.75rem;
+  padding: 0.85rem 0.95rem;
+
+  border-radius: 14px;
+  background: rgba(2, 6, 23, 0.65);
+  border: 1px solid rgba(246, 201, 121, 0.45);
+
+  box-shadow:
+    0 0 0 1px rgba(246, 201, 121, 0.18),
+    0 14px 36px rgba(0, 0, 0, 0.6);
+}
+
+.status-line.auth-status[data-kind="success"] {
+  border-color: rgba(246, 201, 121, 0.75);
+  box-shadow:
+    0 0 0 1px rgba(246, 201, 121, 0.28),
+    0 18px 44px rgba(0, 0, 0, 0.65);
+}
+
+.status-line.auth-status[data-kind="error"] {
+  background: rgba(127, 29, 29, 0.25);
+  border-color: rgba(248, 113, 113, 0.7);
+  color: rgba(255, 255, 255, 0.98);
+}
+
+/* =========================================================
    AUTH CARD
    ========================================================= */
 
@@ -640,8 +678,9 @@ body.chat-app .content {
   box-shadow: 0 0 26px rgba(248, 113, 113, 0.55);
 }
 
+/* UPDATED: speaker muted uses aria-pressed="true" (same as mic) */
 #mic-btn[aria-pressed="true"],
-#speaker-btn[aria-pressed="false"] {
+#speaker-btn[aria-pressed="true"] {
   background: rgba(15, 23, 42, 0.9);
   border-color: rgba(148, 163, 184, 0.85);
 }
@@ -697,7 +736,9 @@ body.chat-app .content {
   flex: 1;
 }
 
-.ts-header h1 {
+/* UPDATED: support h2 (call.html uses h2 for Live Transcription) */
+.ts-header h1,
+.ts-header h2 {
   font-size: 1.1rem;
   font-weight: 600;
   color: var(--text-gold);
@@ -1147,4 +1188,64 @@ body.page-call #tsList {
 body.page-call .ts-list {
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
+}
+
+/* =========================================================
+   CALL POLISH: Audio Resume Overlay + Debug HUD
+   ========================================================= */
+
+.audio-resume-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.audio-resume-card {
+  width: min(420px, 92vw);
+  border-radius: 16px;
+  padding: 16px 16px 14px;
+  background: rgba(15, 20, 30, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  box-shadow: 0 18px 55px rgba(0, 0, 0, 0.55);
+  text-align: center;
+}
+
+.audio-resume-title {
+  font-weight: 700;
+  font-size: 1.05rem;
+  margin-bottom: 4px;
+  color: var(--text-main);
+}
+
+.audio-resume-sub {
+  font-size: 0.92rem;
+  opacity: 0.85;
+  margin-bottom: 12px;
+  color: var(--text-muted);
+}
+
+/* Dev HUD (toggle with "d") */
+.call-debug {
+  position: fixed;
+  left: 10px;
+  bottom: 10px;
+  z-index: 9998;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  box-shadow: 0 18px 55px rgba(0, 0, 0, 0.45);
+  font: 12px/1.3 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  max-width: min(520px, 92vw);
+  white-space: pre;
+  color: rgba(255, 255, 255, 0.92);
+  pointer-events: none; /* doesn't block controls */
 }

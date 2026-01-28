@@ -1,3 +1,4 @@
+<!-- call.html -->
 <!doctype html>
 <html lang="en">
 <head>
@@ -50,6 +51,19 @@
     </a>
   </header>
 
+  <!-- Audio resume overlay (only shown if Safari blocks playback) -->
+  <div id="audio-resume-overlay" class="audio-resume-overlay" hidden>
+    <div class="audio-resume-card" role="dialog" aria-modal="true" aria-label="Resume audio">
+      <div class="audio-resume-title">Audio paused</div>
+      <div class="audio-resume-sub">
+        Tap to resume audio.
+      </div>
+      <button id="audio-resume-btn" class="btn primary" type="button">
+        Tap to resume
+      </button>
+    </div>
+  </div>
+
   <!-- Main content -->
   <main class="content call-layout" role="main">
     <!-- Left: call card -->
@@ -70,8 +84,11 @@
           </div>
 
           <div class="call-status">
-            <span id="status-text">Tap the blue call button to begin.</span>
+            <span id="status-text" aria-live="polite" aria-atomic="true">
+              Tap the blue call button to begin.
+            </span>
           </div>
+
           <div class="call-timer" id="call-timer">00:00</div>
 
           <!-- Call controls -->
@@ -102,17 +119,19 @@
               <div class="call-label" id="mic-label">Mute</div>
             </div>
 
+            <!-- Audio output toggle (accurate for iPhone speaker / AirPods / car / etc.) -->
             <div class="call-control">
               <button
                 id="speaker-btn"
                 class="btn circle"
                 type="button"
-                aria-pressed="true"
-                aria-label="Toggle speaker"
+                aria-pressed="false"
+                aria-label="Toggle audio"
+                title="Toggle audio"
               >
-                🔊
+                🔈
               </button>
-              <div class="call-label" id="speaker-label">Speaker</div>
+              <div class="call-label" id="speaker-label">Audio</div>
             </div>
           </div>
 
@@ -139,7 +158,7 @@
           <div class="title-wrap">
             <div class="title-left">
               <span class="dot" aria-hidden="true"></span>
-              <h1 style="margin:0;">Live Transcription</h1>
+              <h2 style="margin:0;">Live Transcription</h2>
             </div>
             <div class="sub">
               <span class="live is-live">Live</span>
@@ -167,7 +186,7 @@
             </button>
           </div>
           <span class="hint">
-            Tip: Press <code>c</code> to return to chat.
+            Tip: Press <code>c</code> to return to chat. Press <code>d</code> to toggle debug.
           </span>
         </div>
       </div>
@@ -177,6 +196,9 @@
   <footer class="sow-footer tiny">
     Built for sons, warriors, and kings learning to govern their homes.
   </footer>
+
+  <!-- Dev HUD (hidden by default; toggle with "d") -->
+  <div id="call-debug" class="call-debug" hidden></div>
 
   <!-- Back to home (same conversation) -->
   <script type="module">

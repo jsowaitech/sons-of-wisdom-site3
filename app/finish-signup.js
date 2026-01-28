@@ -1,7 +1,9 @@
-// app/finish-signup.js
-// - Opened via link from Supabase (signup or recovery)
-// - Confirms link, lets user set password
-// - Signs out and sends back to auth.html for normal sign in
+// ========================= UPDATED app/finish-signup.js =========================
+// Only intentional changes:
+// 1) After link is confirmed, show a SUCCESS banner briefly ("Link confirmed...")
+// 2) After password saved, use kind="success" so it pops
+// Everything else is identical.
+// ===============================================================================
 
 import { supabase } from "./supabase.js";
 
@@ -75,7 +77,9 @@ async function init() {
     if (setpwEmailLine) setpwEmailLine.style.display = "block";
   }
 
-  setStatus("", "info");
+  // NEW: show a noticeable success banner briefly
+  setStatus("✅ Link confirmed. Create your password below.", "success");
+  setTimeout(() => setStatus("", "info"), 1600);
 }
 
 setpwForm?.addEventListener("submit", async (e) => {
@@ -121,7 +125,8 @@ setpwForm?.addEventListener("submit", async (e) => {
       return;
     }
 
-    setStatus("Password saved. Redirecting you to sign in…", "info");
+    // NEW: use success kind so it pops
+    setStatus("✅ Password saved. Redirecting you to sign in…", "success");
 
     await supabase.auth.signOut();
 

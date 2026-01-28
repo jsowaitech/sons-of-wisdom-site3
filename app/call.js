@@ -1,9 +1,11 @@
 // app/call.js
 // Son of Wisdom — Call mode (Phone-call pace + iOS-safe layout + reliable audio queue)
-// Endpoints:
-//  - /.netlify/functions/openai-transcribe  (audio -> transcript)
-//  - /.netlify/functions/call-coach         (transcript -> AI text + TTS audio)
-//  - /.netlify/functions/call-greeting      (first greeting -> AI text + TTS audio)
+// Updated:
+// - Rename "Speaker" toggle to "Audio" (accurate for iPhone/AirPods routing)
+// - Status rendering: never claim "Speaker muted"; show "Audio muted" instead
+// - Keep TTS queued while audio muted; drain on unmute
+// - Preserve existing: single renderStatus, correct recorder MIME for transcription,
+//   close AudioContexts on endCall, reset VAD/merge state on background.
 
 const DEBUG = true;
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -25,7 +27,7 @@ const conversationId = urlParams.get("c") || null;
 const callBtn = document.getElementById("call-btn");
 const statusText = document.getElementById("status-text");
 const micBtn = document.getElementById("mic-btn");
-const speakerBtn = document.getElementById("speaker-btn");
+const speakerBtn = document.getElementById("speaker-btn"); // (kept id)
 const modeBtn = document.getElementById("mode-btn");
 
 const transcriptList = document.getElementById("transcriptList");
@@ -38,12 +40,20 @@ const voiceRing = document.getElementById("voiceRing");
 const callTimerEl = document.getElementById("call-timer");
 const callLabelEl = document.getElementById("call-label");
 
+const audioResumeOverlay = document.getElementById("audio-resume-overlay");
+const audioResumeBtn = document.getElementById("audio-resume-btn");
+
+const debugEl = document.getElementById("call-debug");
+
 /* ---------- STATE ---------- */
 let isCalling = false;
 let isRecording = false;
 
 let micMuted = false;
-let speakerMuted = false;
+
+// IMPORTANT: This is NOT the iPhone "speaker route".
+// It's simply whether the web app is allowed to play audio (whatever route iOS chooses).
+let audioMuted = false;
 
 let autoScroll = true;
 let lastFinalLine = "";
@@ -51,11 +61,13 @@ let lastFinalLine = "";
 /* merge buffer */
 let mergedTranscriptBuffer = "";
 let mergeTimer = null;
+let isMerging = false;
 
 /* audio recording */
 let globalStream = null;
 let mediaRecorder = null;
 let recordChunks = [];
+let recordMimeType = "audio/webm";
 
 /* VAD */
 let vadAC = null;
@@ -83,6 +95,10 @@ const THRESHOLD_MULTIPLIER = 2.25;
 const THRESHOLD_MIN = 0.018;
 const THRESHOLD_MAX = 0.095;
 
+/* VAD hysteresis (polish) */
+const VAD_START_MULT = 1.10;
+const VAD_CONT_MULT = 0.85;
+
 /* Barge-in debouncing (less sensitive) */
 const BARGE_MIN_HOLD_MS = 240;     // must be sustained
 const BARGE_COOLDOWN_MS = 900;     // ignore early echo right after AI starts
@@ -101,6 +117,9 @@ let playbackAC = null;
 let playbackAnalyser = null;
 let playbackData = null;
 let audioUnlocked = false;
+
+/* playback epoch guard (prevents stale ended/error) */
+let playbackEpoch = 0;
 
 /* AI speaking flags */
 let isPlayingAI = false;
@@ -136,15 +155,91 @@ const USER_TURN_DEDUPE_MS = 2200;
 const ttsQueue = [];
 let ttsDraining = false;
 
+/* Debug HUD */
+let debugOn = false;
+
+/* Status flags (fix UI inaccuracies) */
+let isTranscribing = false;
+let isThinking = false;
+let pausedInBackground = false;
+let transientStatus = "";
+let transientUntil = 0;
+
 /* ---------- Helpers ---------- */
 function setStatus(t) {
   if (!statusText) return;
   statusText.textContent = t || "";
 }
+
+function setTransientStatus(t, ms = 1600) {
+  transientStatus = t || "";
+  transientUntil = transientStatus ? (performance.now() + ms) : 0;
+  renderStatus();
+}
+
+function renderStatus() {
+  // Priority order: paused > resume overlay hint > AI speaking > transcribing > thinking > merging > transient > mic muted > audio muted > default
+  if (!isCalling) {
+    setStatus("Tap the blue call button to begin.");
+    return;
+  }
+
+  if (pausedInBackground) {
+    setStatus("Paused (app in background). Tap to resume.");
+    return;
+  }
+
+  // If Safari blocked playback, overlay will show; keep status helpful.
+  if (!audioResumeOverlay?.hidden) {
+    setStatus("Tap to resume audio.");
+    return;
+  }
+
+  // AI speaking status should win even if audioMuted (still accurate: AI is replying).
+  if (isPlayingAI) {
+    setStatus(audioMuted ? "AI replying… (audio muted)" : "AI replying…");
+    return;
+  }
+
+  if (isTranscribing) {
+    setStatus("Transcribing…");
+    return;
+  }
+
+  if (isThinking) {
+    setStatus("Thinking…");
+    return;
+  }
+
+  if (isMerging) {
+    setStatus("Finishing your thought…");
+    return;
+  }
+
+  const now = performance.now();
+  if (transientStatus && transientUntil && now < transientUntil) {
+    setStatus(transientStatus);
+    return;
+  }
+
+  if (micMuted) {
+    setStatus("Mic muted.");
+    return;
+  }
+
+  if (audioMuted) {
+    setStatus("Audio muted.");
+    return;
+  }
+
+  setStatus("Listening…");
+}
+
 function setInterim(t) {
   if (!transcriptInterim) return;
   transcriptInterim.textContent = t || "";
 }
+
 function addFinalLine(t) {
   if (!transcriptList) return;
   const s = (t || "").trim();
@@ -158,14 +253,37 @@ function addFinalLine(t) {
 
   if (autoScroll) transcriptList.scrollTop = transcriptList.scrollHeight;
 }
+
 function clearTranscript() {
   if (transcriptList) transcriptList.innerHTML = "";
   setInterim("");
   lastFinalLine = "";
   mergedTranscriptBuffer = "";
+  if (mergeTimer) clearTimeout(mergeTimer);
+  mergeTimer = null;
+  isMerging = false;
+  renderStatus();
 }
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function showAudioResumeOverlay() {
+  if (!audioResumeOverlay) return;
+  audioResumeOverlay.hidden = false;
+  renderStatus();
+}
+
+function hideAudioResumeOverlay() {
+  if (!audioResumeOverlay) return;
+  audioResumeOverlay.hidden = true;
+  renderStatus();
+}
+
+function setDebugText(t) {
+  if (!debugEl) return;
+  debugEl.textContent = t || "";
 }
 
 /* ---------- Buttons ---------- */
@@ -192,22 +310,80 @@ micBtn?.addEventListener("click", () => {
   const lbl = document.getElementById("mic-label");
   if (lbl) lbl.textContent = micMuted ? "Unmute" : "Mute";
 
-  setStatus(micMuted ? "Mic muted." : "Mic unmuted.");
+  renderStatus();
 });
 
-speakerBtn?.addEventListener("click", () => {
-  speakerMuted = !speakerMuted;
-  speakerBtn?.setAttribute("aria-pressed", String(!speakerMuted));
+function setAudioMutedUI(muted) {
+  audioMuted = !!muted;
+
+  // Convention: aria-pressed="true" means "muted"
+  speakerBtn?.setAttribute("aria-pressed", String(audioMuted));
 
   if (ttsPlayer) {
-    ttsPlayer.muted = speakerMuted;
-    ttsPlayer.volume = speakerMuted ? 0 : 1;
+    ttsPlayer.muted = audioMuted;
+    ttsPlayer.volume = audioMuted ? 0 : 1;
   }
 
   const lbl = document.getElementById("speaker-label");
-  if (lbl) lbl.textContent = speakerMuted ? "Speaker Off" : "Speaker";
+  if (lbl) lbl.textContent = audioMuted ? "Audio Off" : "Audio";
 
-  setStatus(speakerMuted ? "Speaker muted." : "Speaker on.");
+  // If unmuting, resume draining queued TTS
+  if (!audioMuted) drainTTSQueue();
+
+  renderStatus();
+}
+
+speakerBtn?.addEventListener("click", () => {
+  setAudioMutedUI(!audioMuted);
+});
+
+audioResumeBtn?.addEventListener("click", async () => {
+  hideAudioResumeOverlay();
+  await unlockAudioSystem();
+  try {
+    if (ttsPlayer && !audioMuted) await ttsPlayer.play().catch(() => {});
+  } catch {}
+});
+
+/* Debug toggle + quick key to chat */
+window.addEventListener("keydown", (e) => {
+  const k = (e.key || "").toLowerCase();
+  if (k === "d") {
+    debugOn = !debugOn;
+    if (debugEl) debugEl.hidden = !debugOn;
+  }
+  if (k === "c") {
+    const url = new URL("home.html", window.location.origin);
+    if (conversationId) url.searchParams.set("c", conversationId);
+    window.location.href = url.toString();
+  }
+});
+
+/* Visibility handling (iOS hardening) */
+document.addEventListener("visibilitychange", async () => {
+  if (!isCalling) return;
+
+  if (document.hidden) {
+    pausedInBackground = true;
+
+    try { ttsPlayer?.pause(); } catch {}
+    try { if (isRecording) await stopRecordingTurn({ discard: true }); } catch {}
+
+    // Reset VAD/merge so we don't come back in a weird state.
+    vadState = "idle";
+    bargeVoiceStart = 0;
+    mergedTranscriptBuffer = "";
+    if (mergeTimer) clearTimeout(mergeTimer);
+    mergeTimer = null;
+    isMerging = false;
+    setInterim("");
+
+    renderStatus();
+  } else {
+    pausedInBackground = false;
+    await unlockAudioSystem();
+    renderStatus();
+  }
 });
 
 /* ---------- IDs ---------- */
@@ -231,8 +407,8 @@ function ensureSharedAudio() {
   ttsPlayer.preload = "auto";
   ttsPlayer.playsInline = true;
   ttsPlayer.crossOrigin = "anonymous";
-  ttsPlayer.muted = speakerMuted;
-  ttsPlayer.volume = speakerMuted ? 0 : 1;
+  ttsPlayer.muted = audioMuted;
+  ttsPlayer.volume = audioMuted ? 0 : 1;
 
   return ttsPlayer;
 }
@@ -322,6 +498,13 @@ function pickSupportedMime() {
   return "audio/webm";
 }
 
+function mimeToExt(mime) {
+  const m = (mime || "").toLowerCase();
+  if (m.includes("mp4")) return "m4a";
+  if (m.includes("ogg")) return "ogg";
+  return "webm";
+}
+
 /* ---------- Mic stream ---------- */
 async function ensureMicStream() {
   if (globalStream) return globalStream;
@@ -388,7 +571,7 @@ function maybeUpdateNoiseFloor(energy, now) {
   lastNoiseUpdate = now;
 
   // only learn noise floor when NOT speaking
-  const capped = Math.min(energy, noiseFloor * 3 + 0.01);
+  const capped = Math.min(energy, noiseFloor * 2.5 + 0.008); // slightly tighter to avoid runaway
 
   const alpha = 0.10;
   noiseFloor = noiseFloor * (1 - alpha) + capped * alpha;
@@ -401,6 +584,7 @@ async function startRecordingTurn() {
   const stream = await ensureMicStream();
   const mimeType = pickSupportedMime();
 
+  recordMimeType = mimeType;
   recordChunks = [];
   mediaRecorder = new MediaRecorder(stream, { mimeType });
   isRecording = true;
@@ -433,16 +617,19 @@ async function stopRecordingTurn({ discard = false } = {}) {
 async function transcribeTurn() {
   if (!recordChunks.length) return "";
 
-  setStatus("Transcribing…");
+  isTranscribing = true;
+  renderStatus();
 
   try { transcribeAbort?.abort(); } catch {}
   transcribeAbort = new AbortController();
 
   try {
-    const blob = new Blob(recordChunks, { type: "audio/webm" });
+    const blob = new Blob(recordChunks, { type: recordMimeType || "audio/webm" });
+    const ext = mimeToExt(recordMimeType);
+    const filename = `user.${ext}`;
 
     const fd = new FormData();
-    fd.append("file", blob, "user.webm");
+    fd.append("file", blob, filename);
     fd.append("model", TRANSCRIBE_MODEL);
     fd.append("response_format", "json");
 
@@ -466,6 +653,8 @@ async function transcribeTurn() {
     return "";
   } finally {
     transcribeAbort = null;
+    isTranscribing = false;
+    renderStatus();
   }
 }
 
@@ -477,7 +666,9 @@ function queueMergedSend(transcript) {
     ? `${mergedTranscriptBuffer} ${transcript}`.trim()
     : transcript.trim();
 
-  setInterim("Paused… (merging)");
+  isMerging = true;
+  setInterim("…");
+  renderStatus();
 
   if (mergeTimer) clearTimeout(mergeTimer);
 
@@ -486,7 +677,9 @@ function queueMergedSend(transcript) {
 
     const final = mergedTranscriptBuffer.trim();
     mergedTranscriptBuffer = "";
+    isMerging = false;
     setInterim("");
+    renderStatus();
 
     if (!final) return;
     if (!isCalling) return;
@@ -526,11 +719,13 @@ async function drainTurnQueue() {
   }
 }
 
-/* ---------- TTS PLAYBACK QUEUE (FIXES “ALTERNATING SKIP”) ---------- */
+/* ---------- TTS PLAYBACK QUEUE ---------- */
 async function enqueueTTS(base64, mime) {
-  if (!base64 || speakerMuted) return;
+  if (!base64) return;
   ttsQueue.push({ base64, mime: mime || "audio/mpeg" });
-  drainTTSQueue();
+
+  // Only drain if audio is on; if muted, we keep queued for later.
+  if (!audioMuted) drainTTSQueue();
 }
 
 async function drainTTSQueue() {
@@ -538,29 +733,36 @@ async function drainTTSQueue() {
   ttsDraining = true;
 
   try {
-    while (isCalling && ttsQueue.length && !speakerMuted) {
+    while (isCalling && ttsQueue.length && !audioMuted) {
       const item = ttsQueue.shift();
       if (!item?.base64) continue;
 
       isPlayingAI = true;
       aiSpeechStart = performance.now();
-      setStatus("AI replying…");
+      renderStatus();
 
-      // IMPORTANT: while AI is speaking, stop recording and ignore VAD starts (prevents echo->double replies)
+      // While AI is speaking, stop recording and ignore VAD starts (prevents echo->double replies)
       if (isRecording) await stopRecordingTurn({ discard: true });
 
-      await playDataUrlTTS(item.base64, item.mime);
+      const ok = await playDataUrlTTS(item.base64, item.mime);
 
       isPlayingAI = false;
       if (!isCalling) break;
-      setStatus("Listening…");
+
+      if (!ok) {
+        // If playback failed due to gesture lock, overlay is shown by player.
+        renderStatus();
+      } else {
+        hideAudioResumeOverlay();
+        renderStatus();
+      }
     }
   } finally {
     ttsDraining = false;
   }
 }
 
-/* --- super reliable player for Safari: clear src -> load -> set src -> wait -> play --- */
+/* --- event helper --- */
 function waitOnce(target, event, ms = 2000) {
   return new Promise((resolve) => {
     let done = false;
@@ -576,53 +778,95 @@ function waitOnce(target, event, ms = 2000) {
   });
 }
 
-async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 60000) {
+/* --- Unskippable Safari-safe playback: epoch guard + stall watchdog --- */
+async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) {
   const a = ensureSharedAudio();
+  const myEpoch = ++playbackEpoch;
 
-  // hard reset (this is what fixes the “every other one” Safari bug)
+  // hard reset (Safari reliability)
   try { a.pause(); } catch {}
   try { a.removeAttribute("src"); } catch {}
   try { a.src = ""; } catch {}
   try { a.load(); } catch {}
 
-  a.muted = speakerMuted;
-  a.volume = speakerMuted ? 0 : 1;
+  a.muted = audioMuted;
+  a.volume = audioMuted ? 0 : 1;
   a.playsInline = true;
 
   const dataUrl = `data:${mime};base64,${b64}`;
   a.src = dataUrl;
 
-  // let Safari actually parse it before play()
   try { a.load(); } catch {}
   await waitOnce(a, "canplay", 2500);
 
   return new Promise((resolve) => {
     let settled = false;
-    const settle = (ok) => {
-      if (settled) return;
-      settled = true;
+    let lastT = -1;
+    let lastMoveAt = performance.now();
+    let stallTimer = null;
+    let hardTimer = null;
 
+    const cleanup = () => {
       a.onended = null;
       a.onerror = null;
       a.onabort = null;
+      try { if (stallTimer) clearInterval(stallTimer); } catch {}
+      try { if (hardTimer) clearTimeout(hardTimer); } catch {}
+      stallTimer = null;
+      hardTimer = null;
+    };
 
+    const settle = (ok) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       resolve(ok);
     };
 
-    a.onended = () => settle(true);
-    a.onerror = () => settle(false);
-    a.onabort = () => settle(false);
+    // Stall watchdog: if time doesn't advance while playing, retry play()
+    stallTimer = setInterval(() => {
+      if (myEpoch !== playbackEpoch) return; // stale playback
+      if (a.paused) return;
 
-    const to = setTimeout(() => settle(false), hardTimeoutMs);
+      const t = a.currentTime || 0;
+      if (t !== lastT) {
+        lastT = t;
+        lastMoveAt = performance.now();
+      } else {
+        const stalledFor = performance.now() - lastMoveAt;
+        if (stalledFor > 850) {
+          a.play().catch(() => {});
+          lastMoveAt = performance.now();
+        }
+      }
+    }, 250);
+
+    hardTimer = setTimeout(() => {
+      if (myEpoch !== playbackEpoch) return;
+      settle(false);
+    }, hardTimeoutMs);
+
+    a.onended = () => {
+      if (myEpoch !== playbackEpoch) return;
+      hideAudioResumeOverlay();
+      settle(true);
+    };
+    a.onerror = () => {
+      if (myEpoch !== playbackEpoch) return;
+      settle(false);
+    };
+    a.onabort = () => {
+      if (myEpoch !== playbackEpoch) return;
+      settle(false);
+    };
 
     a.play()
       .then(() => {
-        clearTimeout(to);
-        // re-add a long timeout after play starts
-        setTimeout(() => settle(true), hardTimeoutMs);
+        hideAudioResumeOverlay();
       })
       .catch(() => {
-        clearTimeout(to);
+        // Safari gesture lock / audio lost unlock
+        showAudioResumeOverlay();
         settle(false);
       });
   });
@@ -634,7 +878,7 @@ async function playGreetingOnce() {
   greetingDone = true;
 
   try {
-    setStatus("Connecting…");
+    renderStatus();
 
     const resp = await fetch(CALL_GREETING_ENDPOINT, {
       method: "POST",
@@ -665,12 +909,12 @@ async function playGreetingOnce() {
     if (b64) await enqueueTTS(b64, mime);
 
     // ensure greeting plays BEFORE listening begins
-    await drainTTSQueue();
+    if (!audioMuted) await drainTTSQueue();
 
-    if (isCalling) setStatus("Listening…");
+    renderStatus();
   } catch (e) {
     warn("playGreetingOnce failed", e);
-    if (isCalling) setStatus("Listening…");
+    renderStatus();
   }
 }
 
@@ -680,12 +924,13 @@ async function sendTranscriptToCoachAndQueueAudio(transcript) {
   if (!text) return false;
   if (!isCalling) return false;
 
-  setStatus("Thinking…");
-
   const seq = ++coachSeq;
 
   try { coachAbort?.abort(); } catch {}
   coachAbort = new AbortController();
+
+  isThinking = true;
+  renderStatus();
 
   try {
     const resp = await fetch(CALL_COACH_ENDPOINT, {
@@ -718,22 +963,25 @@ async function sendTranscriptToCoachAndQueueAudio(transcript) {
 
     if (b64) await enqueueTTS(b64, mime);
 
-    setStatus("Listening…");
     return true;
   } catch (e) {
     if (e?.name === "AbortError") return false;
     warn("sendTranscriptToCoachAndQueueAudio error", e);
-    if (isCalling) setStatus("Network error.");
+    setTransientStatus("Network error.", 1800);
     return false;
   } finally {
     coachAbort = null;
+    isThinking = false;
+    renderStatus();
   }
 }
 
-/* ---------- BARGE-IN (real barge only; ignores echo) ---------- */
+/* ---------- BARGE-IN ---------- */
 function stopAIForBargeIn() {
   if (!ttsPlayer) return;
   if (!isPlayingAI) return;
+
+  playbackEpoch++; // invalidate any pending ended/error from old src
 
   try { ttsPlayer.pause(); } catch {}
   try { ttsPlayer.currentTime = 0; } catch {}
@@ -745,8 +993,15 @@ function stopAIForBargeIn() {
   try { coachAbort?.abort(); } catch {}
   coachAbort = null;
 
+  // clear merge buffer so we don't send stale partials right after barge-in
+  try { if (mergeTimer) clearTimeout(mergeTimer); } catch {}
+  mergeTimer = null;
+  mergedTranscriptBuffer = "";
+  isMerging = false;
+  setInterim("");
+
   isPlayingAI = false;
-  setStatus("Listening…");
+  renderStatus();
   log("🛑 Barge-in: AI stopped");
 }
 
@@ -759,7 +1014,7 @@ async function startVADLoop() {
   lastVoiceTime = performance.now();
   speechStartTime = 0;
 
-  setStatus("Listening…");
+  renderStatus();
   setInterim("");
 
   const loop = async () => {
@@ -770,22 +1025,27 @@ async function startVADLoop() {
 
     const energy = getMicEnergy();
     const now = performance.now();
-    const threshold = computeAdaptiveThreshold();
+    const thr = computeAdaptiveThreshold();
 
-    // if AI is speaking and speaker is ON, do NOT start recording from echo.
+    // Hysteresis thresholds
+    const startThr = thr * VAD_START_MULT;
+    const contThr = thr * VAD_CONT_MULT;
+
+    // If AI is speaking and audio is ON, do NOT start recording from echo.
     // We only allow a barge-in if voice is sustained and clearly louder than threshold.
-    const allowVADStart = !(isPlayingAI && !speakerMuted);
+    const allowVADStart = !(isPlayingAI && !audioMuted);
 
     if (vadState === "idle" && !micMuted) {
       if (allowVADStart) maybeUpdateNoiseFloor(energy, now);
     }
 
-    const isVoice = !micMuted && energy > threshold;
+    const isVoiceStart = !micMuted && energy > startThr;
+    const isVoiceCont = !micMuted && energy > contThr;
 
     // BARGE-IN: only when AI speaking
     if (isPlayingAI && !micMuted) {
       const canBarge = (now - aiSpeechStart) > BARGE_COOLDOWN_MS;
-      const isLoudVoice = energy > (threshold * BARGE_EXTRA_MULT);
+      const isLoudVoice = energy > (thr * BARGE_EXTRA_MULT);
 
       if (canBarge && isLoudVoice) {
         if (!bargeVoiceStart) bargeVoiceStart = now;
@@ -801,7 +1061,7 @@ async function startVADLoop() {
     }
 
     if (vadState === "idle") {
-      if (allowVADStart && isVoice) {
+      if (allowVADStart && isVoiceStart) {
         vadState = "speaking";
         speechStartTime = now;
         lastVoiceTime = now;
@@ -810,11 +1070,11 @@ async function startVADLoop() {
         await startRecordingTurn();
         if (!isCalling) { vadLoopRunning = false; return; }
 
-        setStatus("Listening…");
         setInterim("Speaking…");
+        renderStatus();
       }
     } else if (vadState === "speaking") {
-      if (isVoice) {
+      if (isVoiceCont) {
         lastVoiceTime = now;
         setInterim("Speaking…");
       } else {
@@ -831,13 +1091,13 @@ async function startVADLoop() {
 
           if (speechLen < VAD_MIN_SPEECH_MS) {
             recordChunks = [];
-            setStatus("Listening…");
+            renderStatus();
           } else {
             const transcript = await transcribeTurn();
             if (!isCalling) { vadLoopRunning = false; return; }
 
             if (!transcript) {
-              setStatus("Didn’t catch that. Try again…");
+              setTransientStatus("Didn’t catch that. Try again…", 1400);
             } else {
               queueMergedSend(transcript);
             }
@@ -846,6 +1106,15 @@ async function startVADLoop() {
           lastVoiceTime = now;
         }
       }
+    }
+
+    if (debugOn) {
+      setDebugText(
+        `state=${vadState}  calling=${isCalling}  rec=${isRecording}\n` +
+        `AI=${isPlayingAI}  micMuted=${micMuted}  audioMuted=${audioMuted}\n` +
+        `energy=${energy.toFixed(4)}  noise=${noiseFloor.toFixed(4)}  thr=${thr.toFixed(4)}\n` +
+        `turnQ=${pendingUserTurns.length}  ttsQ=${ttsQueue.length}  epoch=${playbackEpoch}`
+      );
     }
 
     requestAnimationFrame(loop);
@@ -990,8 +1259,9 @@ callBtn?.addEventListener("click", async () => {
 
 async function startCall() {
   isCalling = true;
+  pausedInBackground = false;
+  hideAudioResumeOverlay();
   clearTranscript();
-  setStatus("Connecting…");
 
   callBtn?.classList.add("call-active");
   callBtn?.setAttribute("aria-pressed", "true");
@@ -1011,7 +1281,12 @@ async function startCall() {
   transcribeAbort = null;
   coachAbort = null;
 
+  isTranscribing = false;
+  isThinking = false;
+  isMerging = false;
+
   startTimer();
+  renderStatus();
 
   await playRingOnceOnConnect();
 
@@ -1023,17 +1298,38 @@ async function startCall() {
     // ring -> greeting (guaranteed)
     await playGreetingOnce();
 
-    setStatus("Listening…");
+    renderStatus();
     await startVADLoop();
   } catch (e) {
     warn("startCall error", e);
-    setStatus("Mic permission denied.");
+    setTransientStatus("Mic permission denied.", 2200);
     endCall();
   }
 }
 
+function closeAudioContexts() {
+  try { vadSource?.disconnect(); } catch {}
+  try { vadAnalyser?.disconnect?.(); } catch {}
+  vadSource = null;
+  vadAnalyser = null;
+  vadData = null;
+
+  try { vadAC?.close?.(); } catch {}
+  vadAC = null;
+
+  // Playback context (optional but recommended to avoid iOS leaks)
+  try { playbackAnalyser?.disconnect?.(); } catch {}
+  playbackAnalyser = null;
+  playbackData = null;
+
+  try { playbackAC?.close?.(); } catch {}
+  playbackAC = null;
+}
+
 function endCall() {
   isCalling = false;
+  pausedInBackground = false;
+  hideAudioResumeOverlay();
 
   callBtn?.classList.remove("call-active");
   callBtn?.setAttribute("aria-pressed", "false");
@@ -1044,6 +1340,7 @@ function endCall() {
   try { if (mergeTimer) clearTimeout(mergeTimer); } catch {}
   mergeTimer = null;
   mergedTranscriptBuffer = "";
+  isMerging = false;
 
   pendingUserTurns.length = 0;
   drainingTurns = false;
@@ -1055,6 +1352,9 @@ function endCall() {
   try { coachAbort?.abort(); } catch {}
   transcribeAbort = null;
   coachAbort = null;
+
+  isTranscribing = false;
+  isThinking = false;
 
   stopRing();
 
@@ -1070,11 +1370,14 @@ function endCall() {
 
   try {
     if (ttsPlayer) {
+      playbackEpoch++;
       ttsPlayer.pause();
       ttsPlayer.currentTime = 0;
     }
   } catch {}
   isPlayingAI = false;
+
+  closeAudioContexts();
 
   setStatus("Call ended.");
   setInterim("");
@@ -1082,5 +1385,6 @@ function endCall() {
 
 /* ---------- Boot ---------- */
 ensureSharedAudio();
-setStatus("Tap the blue call button to begin.");
-log("✅ call.js loaded: RELIABLE TTS QUEUE + iOS SAFE + ECHO GUARD + STRICT TURN DEDUPE");
+setAudioMutedUI(audioMuted); // ensure label/icon matches initial state
+renderStatus();
+log("✅ call.js loaded: AUDIO TOGGLE (iPhone/AirPods-safe) + STATUS FIXES + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + iOS RESUME OVERLAY + DEBUG HUD (D)");
