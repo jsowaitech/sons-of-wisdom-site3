@@ -2,17 +2,9 @@
 // Home (chat) page controller — desktop & mobile friendly
 // Wired to Supabase conversation threads + Netlify function (call-coach) with memory.
 //
-// ✅ FIXES (already present):
-// 1) Hamburger reliably appears
-// 2) Hamburger goes to history.html with returnTo + c (so back button works)
-// 3) Uses correct query param (history.js expects returnTo)
-//
-// ✅ NEW (Audio playback in Home chat, iOS Safari-safe):
-// - Shared persistent audio element (ttsPlayer)
-// - unlockAudioSystem() runs on a user gesture (Send click + Speak click)
-// - Plays assistant voice when server returns audio_base64 + mime
-// - Optional "Voice Replies" toggle (defaults ON)
-// - Optional "Tap to play" fallback button if autoplay is blocked
+// ✅ Audio playback in Home chat, iOS Safari-safe
+// ✅ "Voice replies" toggle defaults OFF
+// ✅ Speak button records -> transcribes (multipart) -> shows interim bubble -> replaces with transcript -> sends to AI -> AI replies with text + voice
 
 sessionStorage.removeItem("sow_redirected");
 
@@ -23,8 +15,8 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 
 /* ------------------------------ config -------------------------------- */
-// ✅ use unified endpoint
 const CHAT_URL = "/.netlify/functions/call-coach";
+const TRANSCRIBE_URL = "/.netlify/functions/openai-transcribe";
 
 // DEV toggle: call OpenAI directly from the browser (no server).
 // ⚠️ For development ONLY — never enable this on production.
@@ -46,7 +38,7 @@ let session = null;
 let sending = false;
 let conversationId = null; // Supabase conversations.id
 
-// audio-recording state (for Speak button)
+// audio-recording state (Speak button)
 let recording = false;
 let mediaStream = null;
 let mediaRecorder = null;
@@ -78,7 +70,9 @@ const IS_IOS =
 
 let ttsPlayer = null;
 let audioUnlocked = false;
-let voiceRepliesEnabled = true; // default ON
+
+// ✅ default OFF
+let voiceRepliesEnabled = false;
 
 function ensureSharedAudio() {
   if (ttsPlayer) return ttsPlayer;
@@ -96,7 +90,6 @@ async function unlockAudioSystem() {
   try {
     ensureSharedAudio();
 
-    // iOS "silent unlock" trick
     if (IS_IOS && !audioUnlocked) {
       const a = ensureSharedAudio();
       a.src =
@@ -111,7 +104,7 @@ async function unlockAudioSystem() {
     } else {
       audioUnlocked = true;
     }
-  } catch (e) {
+  } catch {
     // ignore
   }
 }
@@ -152,7 +145,6 @@ function appendBubble(role, text, { audio } = {}) {
   msg.textContent = text || "";
   wrap.appendChild(msg);
 
-  // Optional: add playback control (useful if autoplay is blocked)
   if (audio?.url) {
     const row = document.createElement("div");
     row.className = "bubble-audio-row";
@@ -173,6 +165,17 @@ function appendBubble(role, text, { audio } = {}) {
   refs.chatBox.appendChild(wrap);
   ensureChatScroll();
   return { wrap, msg };
+}
+
+// ✅ NEW: replace an existing bubble's text
+function updateBubbleText(bubbleRef, newText) {
+  try {
+    if (!bubbleRef?.msg) return;
+    bubbleRef.msg.textContent = newText || "";
+    ensureChatScroll();
+  } catch {
+    // ignore
+  }
 }
 
 /* Add a tiny "Voice replies" toggle below status (no HTML changes required) */
@@ -196,7 +199,7 @@ function ensureVoiceToggle() {
 
   const cb = document.createElement("input");
   cb.type = "checkbox";
-  cb.checked = true;
+  cb.checked = false; // default OFF
   cb.addEventListener("change", () => {
     voiceRepliesEnabled = cb.checked;
   });
@@ -227,7 +230,6 @@ function setSendingState(v) {
   if (refs.input && !recording) refs.input.disabled = sending;
 }
 
-/* bubbles */
 function ensureChatScroll() {
   if (!refs.chatBox) return;
   const scroller = refs.chatBox.parentElement || refs.chatBox;
@@ -265,13 +267,8 @@ async function loadConversationHistory(convId) {
 }
 
 /* ---------------------------- networking ------------------------------ */
-/**
- * Unified coach endpoint request.
- * We send both transcript + utterance for compatibility with your function.
- */
 async function coachRequest({ text, source = "chat", wantAudio = false, extra = {} }) {
   if (DEV_DIRECT_OPENAI) {
-    // dev mode returns text only
     const reply = await chatDirectOpenAI(text, extra);
     return { assistant_text: reply, audio_base64: null, mime: null };
   }
@@ -282,10 +279,8 @@ async function coachRequest({ text, source = "chat", wantAudio = false, extra = 
     transcript: text,
     utterance: text,
     user_turn: text,
-    // optional identifiers; safe if missing
     user_id: session?.user?.id || session?.user?.email || "",
     device_id: localStorage.getItem("sow_device_id") || "",
-    // you can ignore on server if you want
     want_audio: !!wantAudio,
     ...extra,
   };
@@ -302,7 +297,6 @@ async function coachRequest({ text, source = "chat", wantAudio = false, extra = 
   }
 
   const data = await res.json().catch(() => ({}));
-  // normalize
   return {
     assistant_text: data.assistant_text ?? data.text ?? data.reply ?? "",
     audio_base64: data.audio_base64 ?? null,
@@ -343,8 +337,34 @@ async function chatDirectOpenAI(text, meta = {}) {
   }
 
   const data = await res.json();
-  const reply = data?.choices?.[0]?.message?.content?.trim() || "";
-  return reply;
+  return data?.choices?.[0]?.message?.content?.trim() || "";
+}
+
+/* ---------------------- multipart transcription ---------------------- */
+async function transcribeAudioBlobMultipart(blob, mime) {
+  const ext =
+    mime?.includes("ogg") ? "ogg" :
+    mime?.includes("mp4") ? "m4a" :
+    mime?.includes("mpeg") ? "mp3" :
+    mime?.includes("webm") ? "webm" : "webm";
+
+  const filename = `audio.${ext}`;
+
+  const fd = new FormData();
+  fd.append("audio", blob, filename);
+
+  const res = await fetch(TRANSCRIBE_URL, {
+    method: "POST",
+    body: fd,
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Transcribe ${res.status}: ${t || res.statusText}`);
+  }
+
+  const data = await res.json().catch(() => ({}));
+  return String(data.text || "").trim();
 }
 
 /* ------------------------------ actions ------------------------------- */
@@ -353,7 +373,6 @@ async function handleSend() {
   const text = refs.input.value.trim();
   if (!text || sending) return;
 
-  // ✅ iOS unlock must be on gesture; Send is a gesture.
   await unlockAudioSystem();
 
   appendBubble("user", text);
@@ -371,11 +390,11 @@ async function handleSend() {
       extra: {
         email: session?.user?.email ?? null,
         page: "home",
+        input_mode: "typed",
         timestamp: new Date().toISOString(),
       },
     });
 
-    // Build audio URL if returned
     let audio = null;
     if (audio_base64 && wantAudio) {
       const { url } = base64ToBlobUrl(audio_base64, mime || "audio/mpeg");
@@ -383,15 +402,10 @@ async function handleSend() {
       audioUrlToRevoke = url;
     }
 
-    // Append assistant bubble (with optional Play button)
     appendBubble("ai", assistant_text || "…", { audio });
 
-    // Try to autoplay (best effort). If blocked, user can tap "Play voice".
     if (audio?.url && wantAudio) {
-      const ok = await playAudioUrl(audio.url);
-      if (!ok) {
-        // leave the Play button visible; nothing else needed
-      }
+      await playAudioUrl(audio.url);
     }
 
     setStatus("Ready.");
@@ -405,7 +419,6 @@ async function handleSend() {
     refs.input.focus();
 
     if (audioUrlToRevoke) {
-      // delay revoke a bit so Safari doesn't lose it mid-play
       setTimeout(() => {
         try {
           URL.revokeObjectURL(audioUrlToRevoke);
@@ -415,7 +428,7 @@ async function handleSend() {
   }
 }
 
-/* -------------------------- SPEAK (record) ---------------------------- */
+/* -------------------------- SPEAK (record -> transcribe -> AI voice) ---------------------------- */
 function pickSupportedMime() {
   const candidates = [
     { mime: "audio/webm;codecs=opus", ext: "webm" },
@@ -431,12 +444,13 @@ function pickSupportedMime() {
 }
 
 async function startRecording() {
+  if (sending) return;
+
   if (!navigator.mediaDevices?.getUserMedia) {
     setStatus("Mic not supported in this browser.", true);
     return;
   }
 
-  // ✅ unlock on gesture (Speak click)
   await unlockAudioSystem();
 
   try {
@@ -450,25 +464,88 @@ async function startRecording() {
     };
 
     mediaRecorder.onstop = async () => {
-      const blob = new Blob(mediaChunks, { type: chosenMime.mime });
+      let audioUrlToRevoke = null;
 
-      // Minimal: use client-side speech-to-text elsewhere if needed.
-      // For now we just confirm capture.
-      // If you want: upload blob to a voice-STT function then call coach.
-      // eslint-disable-next-line no-unused-vars
-      const _blob = blob;
+      // ✅ Create interim bubble first
+      const interimBubble = appendBubble("user", "Transcribing…");
 
-      mediaStream.getTracks().forEach((t) => t.stop());
-      mediaStream = null;
-      mediaRecorder = null;
-      mediaChunks = [];
-      setStatus("Ready.");
+      try {
+        setSendingState(true);
+        setStatus("Transcribing…");
+
+        const blob = new Blob(mediaChunks, { type: chosenMime.mime });
+
+        try {
+          mediaStream?.getTracks()?.forEach((t) => t.stop());
+        } catch {}
+        mediaStream = null;
+
+        mediaRecorder = null;
+        mediaChunks = [];
+
+        // 1) Transcribe
+        const transcriptText = await transcribeAudioBlobMultipart(blob, chosenMime.mime);
+
+        if (!transcriptText) {
+          updateBubbleText(interimBubble, "No speech detected.");
+          setStatus("No speech detected. Try again.", true);
+          return;
+        }
+
+        // ✅ Replace interim bubble with real transcript
+        updateBubbleText(interimBubble, transcriptText);
+
+        // 2) Send transcript to AI and ALWAYS request audio for speak flow
+        setStatus("Thinking…");
+        const { assistant_text, audio_base64, mime } = await coachRequest({
+          text: transcriptText,
+          source: "voice",
+          wantAudio: true,
+          extra: {
+            email: session?.user?.email ?? null,
+            page: "home",
+            input_mode: "speak",
+            timestamp: new Date().toISOString(),
+          },
+        });
+
+        // 3) Render AI reply w/ voice
+        let audio = null;
+        if (audio_base64) {
+          const { url } = base64ToBlobUrl(audio_base64, mime || "audio/mpeg");
+          audio = { url, mime };
+          audioUrlToRevoke = url;
+        }
+
+        appendBubble("ai", assistant_text || "…", { audio });
+
+        if (audio?.url) {
+          await playAudioUrl(audio.url);
+        }
+
+        setStatus("Ready.");
+      } catch (err) {
+        console.error("[HOME] speak flow error:", err);
+        updateBubbleText(interimBubble, "Transcription failed.");
+        appendBubble("ai", "Sorry — I couldn’t process that. Try again.");
+        setStatus("Speak failed. Please try again.", true);
+      } finally {
+        setSendingState(false);
+
+        if (audioUrlToRevoke) {
+          setTimeout(() => {
+            try {
+              URL.revokeObjectURL(audioUrlToRevoke);
+            } catch {}
+          }, 60_000);
+        }
+      }
     };
 
     mediaRecorder.start();
     recording = true;
     refs.speakBtn?.classList.add("recording");
-    refs.speakBtn.textContent = "Stop";
+    if (refs.speakBtn) refs.speakBtn.textContent = "Stop";
     refs.input?.setAttribute("disabled", "true");
     setStatus("Recording… tap Speak again to stop.");
   } catch (err) {
@@ -479,10 +556,12 @@ async function startRecording() {
 
 function stopRecording() {
   if (!mediaRecorder) return;
-  mediaRecorder.stop();
+  try {
+    mediaRecorder.stop();
+  } catch {}
   recording = false;
   refs.speakBtn?.classList.remove("recording");
-  refs.speakBtn.textContent = "Speak";
+  if (refs.speakBtn) refs.speakBtn.textContent = "Speak";
   refs.input?.removeAttribute("disabled");
   setStatus("Processing audio…");
 }
@@ -506,10 +585,8 @@ function initTooltips() {
   document.body.appendChild(tt);
 
   const setContent = (el) => {
-    tt.querySelector(".tt-title").textContent =
-      el.getAttribute("data-tt-title") || "";
-    tt.querySelector(".tt-body").textContent =
-      el.getAttribute("data-tt-body") || "";
+    tt.querySelector(".tt-title").textContent = el.getAttribute("data-tt-title") || "";
+    tt.querySelector(".tt-body").textContent = el.getAttribute("data-tt-body") || "";
   };
 
   const position = (el) => {
@@ -607,7 +684,6 @@ function initTooltips() {
 
 /* ------------------------------ bindings ------------------------------ */
 function bindUI() {
-  // chips -> fill input
   refs.chips.forEach((chip) => {
     chip.addEventListener("click", () => {
       const fill = chip.getAttribute("data-fill") || chip.textContent || "";
@@ -618,10 +694,8 @@ function bindUI() {
     });
   });
 
-  // send button
   refs.sendBtn?.addEventListener("click", handleSend);
 
-  // Enter to send
   refs.input?.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -629,7 +703,6 @@ function bindUI() {
     }
   });
 
-  // tools
   refs.callBtn?.addEventListener("click", () => {
     const url = new URL("call.html", window.location.origin);
     if (conversationId) url.searchParams.set("c", conversationId);
@@ -640,29 +713,19 @@ function bindUI() {
     alert("Files: connect your upload flow here.");
   });
 
-  // SPEAK toggle
   refs.speakBtn?.addEventListener("click", async () => {
-    if (!recording) {
-      await startRecording();
-    } else {
-      stopRecording();
-    }
+    if (sending) return;
+    if (!recording) await startRecording();
+    else stopRecording();
   });
 
-  // ✅ Conversations / history (hamburger)
   refs.hamburger?.addEventListener("click", () => {
     const url = new URL("history.html", window.location.origin);
-
-    // Pass current conversation (optional)
     if (conversationId) url.searchParams.set("c", conversationId);
-
-    // IMPORTANT: history.js expects ?returnTo=...
     url.searchParams.set("returnTo", encodeURIComponent("home.html"));
-
     window.location.href = url.toString();
   });
 
-  // logout
   refs.logoutBtn?.addEventListener("click", async () => {
     try {
       await supabase.auth.signOut();
@@ -681,7 +744,6 @@ async function ensureConversationForUser(user) {
   const existingId = params.get("c");
   const forceNew = params.get("new") === "1";
 
-  // If URL has a conversation id and we're not forcing a new one, verify it
   if (existingId && !forceNew) {
     const { data, error } = await supabase
       .from("conversations")
@@ -690,18 +752,12 @@ async function ensureConversationForUser(user) {
       .eq("user_id", user.id)
       .maybeSingle();
 
-    if (!error && data && data.id) {
-      return data.id;
-    }
+    if (!error && data && data.id) return data.id;
   }
 
-  // Else create a new conversation
   const { data, error } = await supabase
     .from("conversations")
-    .insert({
-      user_id: user.id,
-      title: "New Conversation",
-    })
+    .insert({ user_id: user.id, title: "New Conversation" })
     .select("id")
     .single();
 
@@ -711,12 +767,10 @@ async function ensureConversationForUser(user) {
   }
 
   const newId = data.id;
-  // Update URL to reflect the new conversation and clear ?new=1
   params.set("c", newId);
   params.delete("new");
   url.search = params.toString();
   window.history.replaceState({}, "", url.toString());
-
   return newId;
 }
 
@@ -743,7 +797,6 @@ async function ensureConversationForUser(user) {
   ensureVoiceToggle();
   ensureSharedAudio();
 
-  // Ensure hamburger is visible even if something sets display:none elsewhere
   if (refs.hamburger) refs.hamburger.style.display = "";
 
   setStatus("Signed in. How can I help?");
