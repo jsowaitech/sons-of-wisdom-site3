@@ -10,6 +10,10 @@
 // NEW (KB LEXICON LOCK):
 // ✅ Enforces "only use the language + key terms in the knowledgebase"
 // ✅ Adds strict KB instructions + a rewrite pass to conform output to KB lexicon
+//
+// FIX:
+// ✅ Defines KB_LEXICON_LOCK (your previous version referenced it but never defined it,
+//    causing 500 "KB_LEXICON_LOCK is not defined")
 
 const { Pinecone } = require("@pinecone-database/pinecone");
 const crypto = require("crypto");
@@ -613,6 +617,21 @@ Every answer must:
 All of it in short, TTS-safe, conversational responses.
 `.trim();
 
+// ✅ FIX: This constant was referenced but never defined in your previous file.
+const KB_LEXICON_LOCK = `
+KB LEXICON LOCK (CRITICAL)
+
+You MUST use the exact language and key terms present in the provided KNOWLEDGE BASE CONTEXT whenever you are talking about Son of Wisdom / Solomon Codex concepts.
+
+Do NOT introduce new labels, alternate names, or “helpful synonyms” for Son of Wisdom terms.
+
+Rules:
+- Prefer exact phrases from the KNOWLEDGE BASE CONTEXT when referring to frameworks, roles, and doctrines.
+- If a concept is relevant but the term is not in the KNOWLEDGE BASE CONTEXT, do NOT invent a new “official” label.
+- Never invent framework names, numbered steps, or “official” definitions.
+- Do not translate Son of Wisdom terms into therapy language or generic coaching jargon.
+`.trim();
+
 // ---------- Pinecone setup ----------
 let pineconeClient = null;
 let pineconeIndex = null;
@@ -692,7 +711,6 @@ async function openaiChat(messages, opts = {}) {
     model: OPENAI_MODEL,
     messages,
     temperature: opts.temperature ?? 0.7,
-    // ✅ Reduce repetition
     presence_penalty: opts.presence_penalty ?? 0.4,
     frequency_penalty: opts.frequency_penalty ?? 0.35,
   };
@@ -1124,7 +1142,12 @@ Use this context to stay consistent. Do not read this back to the user.
 
         if (conversation && conversationId) {
           try {
-            await insertConversationMessages(conversation, conversationId, userMessageForAI, reply);
+            await insertConversationMessages(
+              conversation,
+              conversationId,
+              userMessageForAI,
+              reply
+            );
           } catch (e) {
             console.error("[call-coach] conversation logging error:", e);
           }
