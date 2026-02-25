@@ -93,8 +93,7 @@ export const handler = async (event) => {
       });
     });
 
-    // (Optional) collect fields, in case you want to use them later
-    // e.g. "mime" from client, but we primarily trust the file mimeType
+    // (Optional) collect fields
     bb.on("field", (_name, _val) => {});
 
     const finished = new Promise((resolve, reject) => {
@@ -120,12 +119,36 @@ export const handler = async (event) => {
       };
     }
 
+    // ✅ NEW: reject ultra-tiny audio uploads (prevents rapid “couldn’t hear you” loops)
+    // (tune threshold if needed)
+    if (audioBuffer.length < 8000) {
+      return {
+        statusCode: 200,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        },
+        body: JSON.stringify({
+          text: "",
+          skipped: true,
+          reason: "audio_too_small",
+          bytes: audioBuffer.length,
+          received_file_field: gotFileField || null,
+          received_mime: audioMime,
+        }),
+      };
+    }
+
     // Build OpenAI form-data
     const fd = new FormData();
     fd.append("file", new Blob([audioBuffer], { type: audioMime }), audioFilename);
     fd.append("model", MODEL);
 
-    // You can optionally add language hints:
+    // Optional: enforce JSON response shape
+    // fd.append("response_format", "json");
+
+    // Optional language hint:
     // fd.append("language", "en");
 
     const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {

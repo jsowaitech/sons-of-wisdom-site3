@@ -11,6 +11,9 @@
 // - ✅ FIX: Transcript panel autoscrolls the real scroller (#tsList) so lines keep showing
 // - ✅ FIX: Ring plays TWICE before mic/VAD starts (mic is OFF during ring)
 // - ✅ FIX: Less sensitive VAD (higher thresholds + stronger hysteresis)
+// - ✅ FIX (NEW): iOS-safe ring (uses unlocked shared audio element)
+// - ✅ FIX (NEW): VAD voice-hold before starting recording (prevents noise-trigger loops)
+// - ✅ FIX (NEW): Ignore tiny audio blobs before transcribe (prevents "couldn't hear you" loops)
 
 const DEBUG = true;
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -78,6 +81,10 @@ let vadState = "idle";
 let lastVoiceTime = 0;
 let speechStartTime = 0;
 
+/* ✅ NEW: require voice hold before start (prevents noise triggers) */
+const VAD_START_HOLD_MS = 140; // 120–180ms recommended
+let vadStartCandidateAt = 0;
+
 /* Adaptive noise floor */
 let noiseFloor = 0.012;
 let lastNoiseUpdate = 0;
@@ -91,8 +98,8 @@ const VAD_IDLE_TIMEOUT_MS = 30000;
 /* ✅ Less sensitive threshold shaping */
 const NOISE_FLOOR_UPDATE_MS = 300;
 const THRESHOLD_MULTIPLIER = 2.85; // higher = less sensitive
-const THRESHOLD_MIN = 0.026;       // higher floor = less sensitive
-const THRESHOLD_MAX = 0.110;
+const THRESHOLD_MIN = 0.026; // higher floor = less sensitive
+const THRESHOLD_MAX = 0.11;
 
 /* ✅ Stronger hysteresis (reduces jitter/noise triggers) */
 const VAD_START_MULT = 1.25;
@@ -137,8 +144,7 @@ let drainingTurns = false;
 /* Greeting */
 let greetingDone = false;
 
-/* ring.mp3 */
-let ringAudio = null;
+/* ring state */
 let ringPlayed = false;
 
 /* timer */
@@ -172,7 +178,7 @@ function setStatus(t) {
 
 function setTransientStatus(t, ms = 1600) {
   transientStatus = t || "";
-  transientUntil = transientStatus ? (performance.now() + ms) : 0;
+  transientUntil = transientStatus ? performance.now() + ms : 0;
   renderStatus();
 }
 
@@ -256,6 +262,7 @@ function clearTranscript() {
   if (mergeTimer) clearTimeout(mergeTimer);
   mergeTimer = null;
   isMerging = false;
+  vadStartCandidateAt = 0;
   renderStatus();
 }
 
@@ -287,7 +294,8 @@ micBtn?.addEventListener("click", () => {
   micMuted = !micMuted;
   micBtn?.setAttribute("aria-pressed", String(micMuted));
 
-  if (globalStream) globalStream.getAudioTracks().forEach((t) => (t.enabled = !micMuted));
+  if (globalStream)
+    globalStream.getAudioTracks().forEach((t) => (t.enabled = !micMuted));
 
   const lbl = document.getElementById("mic-label");
   if (lbl) lbl.textContent = micMuted ? "Unmute" : "Mute";
@@ -334,11 +342,16 @@ document.addEventListener("visibilitychange", async () => {
   if (document.hidden) {
     pausedInBackground = true;
 
-    try { ttsPlayer?.pause(); } catch {}
-    try { if (isRecording) await stopRecordingTurn({ discard: true }); } catch {}
+    try {
+      ttsPlayer?.pause();
+    } catch {}
+    try {
+      if (isRecording) await stopRecordingTurn({ discard: true });
+    } catch {}
 
     // Reset VAD/merge so we don't come back in a weird state.
     vadState = "idle";
+    vadStartCandidateAt = 0;
     bargeVoiceStart = 0;
     mergedTranscriptBuffer = "";
     if (mergeTimer) clearTimeout(mergeTimer);
@@ -359,7 +372,8 @@ function getDeviceId() {
   const key = "sow_device_id";
   let id = localStorage.getItem(key);
   if (!id) {
-    id = crypto?.randomUUID?.() || `dev_${Math.random().toString(16).slice(2)}`;
+    id =
+      crypto?.randomUUID?.() || `dev_${Math.random().toString(16).slice(2)}`;
     localStorage.setItem(key, id);
   }
   return id;
@@ -420,51 +434,61 @@ async function unlockAudioSystem() {
   }
 }
 
-/* ---------- ring.mp3 SFX ---------- */
-function ensureRingSfx() {
-  if (ringAudio) return ringAudio;
-  ringAudio = new Audio("ring.mp3");
-  ringAudio.preload = "auto";
-  ringAudio.playsInline = true;
-  ringAudio.loop = false;
-  ringAudio.volume = 0.65;
-  return ringAudio;
-}
-
+/* ---------- ring.mp3 SFX (✅ iOS-safe: use SHARED unlocked audio) ---------- */
 async function playRingTwiceOnConnect() {
   if (ringPlayed) return;
   ringPlayed = true;
 
+  // Even if ring audio is blocked, keep UX “ringing” via delay.
+  const RING_FALLBACK_MS = 2300;
+
   try {
-    const r = ensureRingSfx();
-    r.pause();
-    r.currentTime = 0;
-    r.muted = false;
+    const a = ensureSharedAudio(); // ✅ use the already-unlocked player
 
-    // play #1
-    await r.play().catch(() => {});
-    await waitOnce(r, "ended", 4000);
+    const playOnce = async () => {
+      playbackEpoch++; // invalidate old handlers
+      try {
+        a.pause();
+      } catch {}
+      try {
+        a.currentTime = 0;
+      } catch {}
 
-    // small gap
+      a.muted = false;
+      a.volume = speakerMuted ? 0 : 1;
+      a.playsInline = true;
+      a.src = "ring.mp3";
+      try {
+        a.load();
+      } catch {}
+      await waitOnce(a, "canplay", 1200);
+
+      await a.play().catch(() => {
+        throw new Error("ring blocked");
+      });
+
+      await waitOnce(a, "ended", 3500);
+    };
+
+    await playOnce();
     await sleep(180);
+    await playOnce();
 
-    // play #2
-    r.pause();
-    r.currentTime = 0;
-    await r.play().catch(() => {});
-    await waitOnce(r, "ended", 4000);
-
-    log("🔔 ring played twice");
+    log("🔔 ring played twice (shared audio)");
   } catch (e) {
-    warn("ring play failed", e);
+    warn("ring play failed; using fallback delay", e);
+    await sleep(RING_FALLBACK_MS);
+    await sleep(180);
+    await sleep(RING_FALLBACK_MS);
   }
 }
 
 function stopRing() {
+  // Shared audio = just pause/reset
   try {
-    if (!ringAudio) return;
-    ringAudio.pause();
-    ringAudio.currentTime = 0;
+    if (!ttsPlayer) return;
+    ttsPlayer.pause();
+    ttsPlayer.currentTime = 0;
   } catch {}
 }
 
@@ -494,7 +518,11 @@ async function ensureMicStream() {
   if (globalStream) return globalStream;
 
   globalStream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
   });
 
   try {
@@ -555,11 +583,11 @@ function maybeUpdateNoiseFloor(energy, now) {
   lastNoiseUpdate = now;
 
   // only learn noise floor when NOT speaking
-  const capped = Math.min(energy, noiseFloor * 2.0 + 0.010);
+  const capped = Math.min(energy, noiseFloor * 2.0 + 0.01);
   const alpha = 0.09;
 
   noiseFloor = noiseFloor * (1 - alpha) + capped * alpha;
-  noiseFloor = Math.max(0.0045, Math.min(0.060, noiseFloor));
+  noiseFloor = Math.max(0.0045, Math.min(0.06, noiseFloor));
 }
 
 /* ---------- RECORD TURN CONTROL ---------- */
@@ -601,13 +629,23 @@ async function stopRecordingTurn({ discard = false } = {}) {
 async function transcribeTurn() {
   if (!recordChunks.length) return "";
 
+  // ✅ NEW: ignore very small recordings (noise / accidental trigger)
+  const totalSize = recordChunks.reduce((sum, c) => sum + (c?.size || 0), 0);
+  if (totalSize < 8000) {
+    log("⚠️ Ignoring tiny audio blob:", totalSize);
+    recordChunks = [];
+    return "";
+  }
+
   isTranscribing = true;
   renderStatus();
 
-  try { transcribeAbort?.abort(); } catch {}
-  transcribeAbort = new AbortController();
-
   try {
+    try {
+      transcribeAbort?.abort();
+    } catch {}
+    transcribeAbort = new AbortController();
+
     const blob = new Blob(recordChunks, { type: recordMimeType || "audio/webm" });
     const ext = mimeToExt(recordMimeType);
     const filename = `user.${ext}`;
@@ -626,11 +664,15 @@ async function transcribeTurn() {
 
     if (!resp.ok) {
       const t = await resp.text().catch(() => "");
-      throw new Error(`Transcribe HTTP ${resp.status}: ${t || resp.statusText}`);
+      throw new Error(
+        `Transcribe HTTP ${resp.status}: ${t || resp.statusText}`
+      );
     }
 
     const data = await resp.json().catch(() => ({}));
-    const text = (data?.text || data?.transcript || data?.utterance || "").toString().trim();
+    const text = (data?.text || data?.transcript || data?.utterance || "")
+      .toString()
+      .trim();
     return text;
   } catch (e) {
     if (e?.name === "AbortError") return "";
@@ -671,7 +713,7 @@ function queueMergedSend(transcript) {
 
     // DEDUPE (prevents multiple AI replies from same spoken line)
     const now = Date.now();
-    if (final === lastUserSentText && (now - lastUserSentAt) < USER_TURN_DEDUPE_MS) {
+    if (final === lastUserSentText && now - lastUserSentAt < USER_TURN_DEDUPE_MS) {
       log("🟡 dropped duplicate user turn:", final);
       return;
     }
@@ -754,11 +796,15 @@ function waitOnce(target, event, ms = 2000) {
     const finish = () => {
       if (done) return;
       done = true;
-      try { target.removeEventListener(event, onEvt); } catch {}
+      try {
+        target.removeEventListener(event, onEvt);
+      } catch {}
       resolve(true);
     };
     const onEvt = () => finish();
-    try { target.addEventListener(event, onEvt, { once: true }); } catch {}
+    try {
+      target.addEventListener(event, onEvt, { once: true });
+    } catch {}
     setTimeout(() => resolve(false), ms);
   });
 }
@@ -769,10 +815,18 @@ async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) 
   const myEpoch = ++playbackEpoch;
 
   // hard reset (Safari reliability)
-  try { a.pause(); } catch {}
-  try { a.removeAttribute("src"); } catch {}
-  try { a.src = ""; } catch {}
-  try { a.load(); } catch {}
+  try {
+    a.pause();
+  } catch {}
+  try {
+    a.removeAttribute("src");
+  } catch {}
+  try {
+    a.src = "";
+  } catch {}
+  try {
+    a.load();
+  } catch {}
 
   a.muted = speakerMuted;
   a.volume = speakerMuted ? 0 : 1;
@@ -781,7 +835,9 @@ async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) 
   const dataUrl = `data:${mime};base64,${b64}`;
   a.src = dataUrl;
 
-  try { a.load(); } catch {}
+  try {
+    a.load();
+  } catch {}
   await waitOnce(a, "canplay", 2500);
 
   return new Promise((resolve) => {
@@ -795,8 +851,12 @@ async function playDataUrlTTS(b64, mime = "audio/mpeg", hardTimeoutMs = 180000) 
       a.onended = null;
       a.onerror = null;
       a.onabort = null;
-      try { if (stallTimer) clearInterval(stallTimer); } catch {}
-      try { if (hardTimer) clearTimeout(hardTimer); } catch {}
+      try {
+        if (stallTimer) clearInterval(stallTimer);
+      } catch {}
+      try {
+        if (hardTimer) clearTimeout(hardTimer);
+      } catch {}
       stallTimer = null;
       hardTimer = null;
     };
@@ -902,13 +962,15 @@ async function sendTranscriptToCoachAndQueueAudio(transcript) {
 
   const seq = ++coachSeq;
 
-  try { coachAbort?.abort(); } catch {}
-  coachAbort = new AbortController();
-
-  isThinking = true;
-  renderStatus();
-
   try {
+    try {
+      coachAbort?.abort();
+    } catch {}
+    coachAbort = new AbortController();
+
+    isThinking = true;
+    renderStatus();
+
     const resp = await fetch(CALL_COACH_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -959,18 +1021,26 @@ function stopAIForBargeIn() {
 
   playbackEpoch++; // invalidate any pending ended/error from old src
 
-  try { ttsPlayer.pause(); } catch {}
-  try { ttsPlayer.currentTime = 0; } catch {}
+  try {
+    ttsPlayer.pause();
+  } catch {}
+  try {
+    ttsPlayer.currentTime = 0;
+  } catch {}
 
   // stop pending audio in queue
   ttsQueue.length = 0;
 
   // cancel in-flight coach (prevents late reply)
-  try { coachAbort?.abort(); } catch {}
+  try {
+    coachAbort?.abort();
+  } catch {}
   coachAbort = null;
 
   // clear merge buffer so we don't send stale partials right after barge-in
-  try { if (mergeTimer) clearTimeout(mergeTimer); } catch {}
+  try {
+    if (mergeTimer) clearTimeout(mergeTimer);
+  } catch {}
   mergeTimer = null;
   mergedTranscriptBuffer = "";
   isMerging = false;
@@ -987,6 +1057,7 @@ async function startVADLoop() {
   vadLoopRunning = true;
 
   vadState = "idle";
+  vadStartCandidateAt = 0;
   lastVoiceTime = performance.now();
   speechStartTime = 0;
 
@@ -1011,21 +1082,17 @@ async function startVADLoop() {
     // We only allow a barge-in if voice is sustained and clearly louder than threshold.
     const allowVADStart = !(isPlayingAI && !speakerMuted);
 
-    if (vadState === "idle" && !micMuted) {
-      if (allowVADStart) maybeUpdateNoiseFloor(energy, now);
-    }
-
     const isVoiceStart = !micMuted && energy > startThr;
     const isVoiceCont = !micMuted && energy > contThr;
 
     // BARGE-IN: only when AI speaking
     if (isPlayingAI && !micMuted) {
-      const canBarge = (now - aiSpeechStart) > BARGE_COOLDOWN_MS;
-      const isLoudVoice = energy > (thr * BARGE_EXTRA_MULT);
+      const canBarge = now - aiSpeechStart > BARGE_COOLDOWN_MS;
+      const isLoudVoice = energy > thr * BARGE_EXTRA_MULT;
 
       if (canBarge && isLoudVoice) {
         if (!bargeVoiceStart) bargeVoiceStart = now;
-        if ((now - bargeVoiceStart) >= BARGE_MIN_HOLD_MS) {
+        if (now - bargeVoiceStart >= BARGE_MIN_HOLD_MS) {
           stopAIForBargeIn();
           bargeVoiceStart = 0;
         }
@@ -1037,18 +1104,36 @@ async function startVADLoop() {
     }
 
     if (vadState === "idle") {
+      // ✅ require voice HOLD before starting record
       if (allowVADStart && isVoiceStart) {
-        vadState = "speaking";
-        speechStartTime = now;
-        lastVoiceTime = now;
+        if (!vadStartCandidateAt) vadStartCandidateAt = now;
 
-        await startRecordingTurn();
-        if (!isCalling) { vadLoopRunning = false; return; }
+        const heldFor = now - vadStartCandidateAt;
+        if (heldFor >= VAD_START_HOLD_MS) {
+          vadStartCandidateAt = 0;
 
-        setInterim("Speaking…");
-        renderStatus();
+          vadState = "speaking";
+          speechStartTime = now;
+          lastVoiceTime = now;
+
+          await startRecordingTurn();
+          if (!isCalling) {
+            vadLoopRunning = false;
+            return;
+          }
+
+          setInterim("Speaking…");
+          renderStatus();
+        }
+      } else {
+        vadStartCandidateAt = 0;
+
+        // learn noise floor only when idle
+        if (!micMuted && allowVADStart) maybeUpdateNoiseFloor(energy, now);
       }
     } else if (vadState === "speaking") {
+      vadStartCandidateAt = 0;
+
       if (isVoiceCont) {
         lastVoiceTime = now;
         setInterim("Speaking…");
@@ -1062,14 +1147,20 @@ async function startVADLoop() {
           setInterim("");
 
           await stopRecordingTurn();
-          if (!isCalling) { vadLoopRunning = false; return; }
+          if (!isCalling) {
+            vadLoopRunning = false;
+            return;
+          }
 
           if (speechLen < VAD_MIN_SPEECH_MS) {
             recordChunks = [];
             renderStatus();
           } else {
             const transcript = await transcribeTurn();
-            if (!isCalling) { vadLoopRunning = false; return; }
+            if (!isCalling) {
+              vadLoopRunning = false;
+              return;
+            }
 
             if (!transcript) {
               setTransientStatus("Didn’t catch that. Try again…", 1400);
@@ -1086,9 +1177,11 @@ async function startVADLoop() {
     if (debugOn) {
       setDebugText(
         `state=${vadState}  calling=${isCalling}  rec=${isRecording}\n` +
-        `AI=${isPlayingAI}  micMuted=${micMuted}  spkMuted=${speakerMuted}\n` +
-        `energy=${energy.toFixed(4)}  noise=${noiseFloor.toFixed(4)}  thr=${thr.toFixed(4)}\n` +
-        `turnQ=${pendingUserTurns.length}  ttsQ=${ttsQueue.length}  epoch=${playbackEpoch}`
+          `AI=${isPlayingAI}  micMuted=${micMuted}  spkMuted=${speakerMuted}\n` +
+          `energy=${energy.toFixed(4)}  noise=${noiseFloor.toFixed(
+            4
+          )}  thr=${thr.toFixed(4)}\n` +
+          `turnQ=${pendingUserTurns.length}  ttsQ=${ttsQueue.length}  epoch=${playbackEpoch}`
       );
     }
 
@@ -1155,7 +1248,11 @@ function drawRings() {
   const userPulse = baseR + micAmp * (baseR * 0.18) + Math.sin(t * 3.2) * 2;
   drawGlowRing(cx, cy, userPulse, micAmp, true);
 
-  const aiPulse = baseR + (baseR * 0.12) + aiAmp * (baseR * 0.22) + Math.sin(t * 2.1) * 2;
+  const aiPulse =
+    baseR +
+    baseR * 0.12 +
+    aiAmp * (baseR * 0.22) +
+    Math.sin(t * 2.1) * 2;
   drawGlowRing(cx, cy, aiPulse, aiAmp, false);
 
   ringRAF = requestAnimationFrame(drawRings);
@@ -1220,7 +1317,9 @@ function startTimer() {
 }
 
 function stopTimer() {
-  try { if (timerRAF) cancelAnimationFrame(timerRAF); } catch {}
+  try {
+    if (timerRAF) cancelAnimationFrame(timerRAF);
+  } catch {}
   timerRAF = null;
   if (callTimerEl) callTimerEl.textContent = "00:00";
 }
@@ -1250,21 +1349,26 @@ async function startCall() {
   lastUserSentText = "";
   lastUserSentAt = 0;
 
-  try { transcribeAbort?.abort(); } catch {}
-  try { coachAbort?.abort(); } catch {}
+  try {
+    transcribeAbort?.abort();
+  } catch {}
+  try {
+    coachAbort?.abort();
+  } catch {}
   transcribeAbort = null;
   coachAbort = null;
 
   isTranscribing = false;
   isThinking = false;
   isMerging = false;
+  vadStartCandidateAt = 0;
 
   // ✅ important: do NOT start mic/VAD until ring has played twice
   startTimer();
   renderStatus();
 
   try {
-    // Ring plays twice BEFORE mic/VAD
+    // Ring plays twice BEFORE mic/VAD (mic is still OFF here)
     await playRingTwiceOnConnect();
 
     // Now bring up mic + VAD + visuals
@@ -1274,6 +1378,9 @@ async function startCall() {
 
     // Greeting (TTS)
     await playGreetingOnce();
+
+    // extra determinism: ensure greeting drained before listening
+    if (!speakerMuted) await drainTTSQueue();
 
     renderStatus();
     await startVADLoop();
@@ -1285,21 +1392,31 @@ async function startCall() {
 }
 
 function closeAudioContexts() {
-  try { vadSource?.disconnect(); } catch {}
-  try { vadAnalyser?.disconnect?.(); } catch {}
+  try {
+    vadSource?.disconnect();
+  } catch {}
+  try {
+    vadAnalyser?.disconnect?.();
+  } catch {}
   vadSource = null;
   vadAnalyser = null;
   vadData = null;
 
-  try { vadAC?.close?.(); } catch {}
+  try {
+    vadAC?.close?.();
+  } catch {}
   vadAC = null;
 
   // Playback context (optional but recommended to avoid iOS leaks)
-  try { playbackAnalyser?.disconnect?.(); } catch {}
+  try {
+    playbackAnalyser?.disconnect?.();
+  } catch {}
   playbackAnalyser = null;
   playbackData = null;
 
-  try { playbackAC?.close?.(); } catch {}
+  try {
+    playbackAC?.close?.();
+  } catch {}
   playbackAC = null;
 }
 
@@ -1313,10 +1430,13 @@ function endCall() {
 
   stopTimer();
 
-  try { if (mergeTimer) clearTimeout(mergeTimer); } catch {}
+  try {
+    if (mergeTimer) clearTimeout(mergeTimer);
+  } catch {}
   mergeTimer = null;
   mergedTranscriptBuffer = "";
   isMerging = false;
+  vadStartCandidateAt = 0;
 
   pendingUserTurns.length = 0;
   drainingTurns = false;
@@ -1324,8 +1444,12 @@ function endCall() {
   ttsQueue.length = 0;
   ttsDraining = false;
 
-  try { transcribeAbort?.abort(); } catch {}
-  try { coachAbort?.abort(); } catch {}
+  try {
+    transcribeAbort?.abort();
+  } catch {}
+  try {
+    coachAbort?.abort();
+  } catch {}
   transcribeAbort = null;
   coachAbort = null;
 
@@ -1341,7 +1465,9 @@ function endCall() {
   isRecording = false;
   recordChunks = [];
 
-  try { globalStream?.getTracks().forEach((t) => t.stop()); } catch {}
+  try {
+    globalStream?.getTracks().forEach((t) => t.stop());
+  } catch {}
   globalStream = null;
 
   try {
@@ -1362,4 +1488,6 @@ function endCall() {
 /* ---------- Boot ---------- */
 ensureSharedAudio();
 renderStatus();
-log("✅ call.js loaded: RING x2 MIC GATE + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + STATUS RENDER FIX + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)");
+log(
+  "✅ call.js loaded: iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + STATUS RENDER FIX + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
+);
