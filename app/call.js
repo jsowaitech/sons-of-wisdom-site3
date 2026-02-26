@@ -14,6 +14,7 @@
 // - ✅ FIX (NEW): iOS-safe ring (uses unlocked shared audio element)
 // - ✅ FIX (NEW): VAD voice-hold before starting recording (prevents noise-trigger loops)
 // - ✅ FIX (NEW): Ignore tiny audio blobs before transcribe (prevents "couldn't hear you" loops)
+// - ✅ FIX (NEW): Status correctness during ring + greeting (Connecting… / AI replying… / then Listening…)
 
 const DEBUG = true;
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -81,7 +82,7 @@ let vadState = "idle";
 let lastVoiceTime = 0;
 let speechStartTime = 0;
 
-/* ✅ NEW: require voice hold before start (prevents noise triggers) */
+/* ✅ require voice hold before start (prevents noise triggers) */
 const VAD_START_HOLD_MS = 140; // 120–180ms recommended
 let vadStartCandidateAt = 0;
 
@@ -170,6 +171,9 @@ let pausedInBackground = false;
 let transientStatus = "";
 let transientUntil = 0;
 
+/* ✅ Call phases so status never says "Listening" during ring/greeting */
+let callPhase = "idle"; // idle | connecting | greeting | live
+
 /* ---------- Helpers ---------- */
 function setStatus(t) {
   if (!statusText) return;
@@ -183,7 +187,8 @@ function setTransientStatus(t, ms = 1600) {
 }
 
 function renderStatus() {
-  // Priority order: paused > AI speaking > transcribing > thinking > merging > transient > mic muted > default
+  // Priority order:
+  // not calling > paused > connecting/greeting > AI speaking > transcribing > thinking > merging > transient > mic muted > live listening
   if (!isCalling) {
     setStatus("Tap the blue call button to begin.");
     return;
@@ -191,6 +196,12 @@ function renderStatus() {
 
   if (pausedInBackground) {
     setStatus("Paused (app in background). Tap to resume.");
+    return;
+  }
+
+  // ✅ NEW: Don't show "Listening" until we are truly live
+  if (callPhase === "connecting" || callPhase === "greeting") {
+    setStatus("Connecting…");
     return;
   }
 
@@ -225,7 +236,8 @@ function renderStatus() {
     return;
   }
 
-  setStatus("Listening…");
+  if (callPhase === "live") setStatus("Listening…");
+  else setStatus("Connecting…");
 }
 
 function setInterim(t) {
@@ -341,6 +353,7 @@ document.addEventListener("visibilitychange", async () => {
 
   if (document.hidden) {
     pausedInBackground = true;
+  
 
     try {
       ttsPlayer?.pause();
@@ -363,6 +376,7 @@ document.addEventListener("visibilitychange", async () => {
   } else {
     pausedInBackground = false;
     await unlockAudioSystem();
+    callPhase = "connecting";
     renderStatus();
   }
 });
@@ -629,7 +643,7 @@ async function stopRecordingTurn({ discard = false } = {}) {
 async function transcribeTurn() {
   if (!recordChunks.length) return "";
 
-  // ✅ NEW: ignore very small recordings (noise / accidental trigger)
+  // ✅ ignore very small recordings (noise / accidental trigger)
   const totalSize = recordChunks.reduce((sum, c) => sum + (c?.size || 0), 0);
   if (totalSize < 8000) {
     log("⚠️ Ignoring tiny audio blob:", totalSize);
@@ -664,9 +678,7 @@ async function transcribeTurn() {
 
     if (!resp.ok) {
       const t = await resp.text().catch(() => "");
-      throw new Error(
-        `Transcribe HTTP ${resp.status}: ${t || resp.statusText}`
-      );
+      throw new Error(`Transcribe HTTP ${resp.status}: ${t || resp.statusText}`);
     }
 
     const data = await resp.json().catch(() => ({}));
@@ -942,10 +954,21 @@ async function playGreetingOnce() {
 
     if (replyText) addFinalLine("AI: " + replyText);
 
-    if (b64) await enqueueTTS(b64, mime);
+    if (b64) {
+      await enqueueTTS(b64, mime);
 
-    // ensure greeting plays BEFORE listening begins
-    if (!speakerMuted) await drainTTSQueue();
+      // ✅ Make status match reality: AI is about to speak
+      if (!speakerMuted) {
+        isPlayingAI = true;
+        aiSpeechStart = performance.now();
+        renderStatus();
+
+        await drainTTSQueue();
+
+        isPlayingAI = false;
+        renderStatus();
+      }
+    }
 
     renderStatus();
   } catch (e) {
@@ -1333,6 +1356,7 @@ callBtn?.addEventListener("click", async () => {
 
 async function startCall() {
   isCalling = true;
+  callPhase = "connecting";
   pausedInBackground = false;
   clearTranscript();
 
@@ -1376,13 +1400,20 @@ async function startCall() {
     setupRingCanvas();
     if (!ringRAF) drawRings();
 
+    // ✅ Greeting phase
+    callPhase = "greeting";
+    renderStatus();
+
     // Greeting (TTS)
     await playGreetingOnce();
 
     // extra determinism: ensure greeting drained before listening
     if (!speakerMuted) await drainTTSQueue();
 
+    // ✅ only now we are truly live
+    callPhase = "live";
     renderStatus();
+
     await startVADLoop();
   } catch (e) {
     warn("startCall error", e);
@@ -1422,6 +1453,7 @@ function closeAudioContexts() {
 
 function endCall() {
   isCalling = false;
+  callPhase = "idle";
   pausedInBackground = false;
 
   callBtn?.classList.remove("call-active");
@@ -1489,5 +1521,5 @@ function endCall() {
 ensureSharedAudio();
 renderStatus();
 log(
-  "✅ call.js loaded: iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + STATUS RENDER FIX + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
+  "✅ call.js loaded: CONNECTING status during ring+greeting + iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + STATUS RENDER FIX + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
 );

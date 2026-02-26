@@ -14,6 +14,11 @@
 // FIX:
 // ✅ Defines KB_LEXICON_LOCK (your previous version referenced it but never defined it,
 //    causing 500 "KB_LEXICON_LOCK is not defined")
+//
+// NEW (AUDIO RELIABILITY PATCH):
+// ✅ audio_expected: tells client we attempted/expected audio
+// ✅ audio_missing: tells client audio did not arrive
+// ✅ audio_error: short diagnostic string for logging/UI
 
 const { Pinecone } = require("@pinecone-database/pinecone");
 const crypto = require("crypto");
@@ -917,12 +922,14 @@ async function insertConversationMessages(conversation, conversationId, userText
   });
 }
 
-// ---------- ElevenLabs TTS ----------
+// ---------- ElevenLabs TTS (hardened) ----------
 async function elevenLabsTTS(text) {
-  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) return null;
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
+    return { audio: null, error: "Missing ELEVENLABS env vars" };
+  }
 
   const trimmed = String(text || "").trim();
-  if (!trimmed) return null;
+  if (!trimmed) return { audio: null, error: "Empty TTS text" };
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`;
 
@@ -942,12 +949,11 @@ async function elevenLabsTTS(text) {
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    console.error("[call-coach] ElevenLabs TTS error:", res.status, t || res.statusText);
-    return null;
+    return { audio: null, error: `ElevenLabs ${res.status}: ${t || res.statusText}` };
   }
 
   const buf = Buffer.from(await res.arrayBuffer());
-  return { audio_base64: buf.toString("base64"), mime: "audio/mpeg" };
+  return { audio: { audio_base64: buf.toString("base64"), mime: "audio/mpeg" }, error: null };
 }
 
 async function tryInsertCallSession(row) {
@@ -1031,6 +1037,7 @@ exports.handler = async (event) => {
           text: "",
           conversationId: conversationId || null,
           call_id: callId || null,
+          audio_expected: source === "voice" || source === "chat",
         }),
       };
     }
@@ -1154,13 +1161,20 @@ Use this context to stay consistent. Do not read this back to the user.
         }
       }
 
-      // ElevenLabs TTS
+      // ElevenLabs TTS (reliability flags)
+      const audio_expected = source === "voice" || source === "chat";
       let audio = null;
-      if (source === "voice" || source === "chat") {
+      let audio_error = null;
+
+      if (audio_expected) {
         try {
-          audio = await elevenLabsTTS(reply);
+          const ttsRes = await elevenLabsTTS(reply);
+          audio = ttsRes?.audio || null;
+          audio_error = ttsRes?.error || null;
+          if (audio_error) console.error("[call-coach] TTS error:", audio_error);
         } catch (e) {
-          console.error("[call-coach] TTS error:", e);
+          audio_error = String(e?.message || e);
+          console.error("[call-coach] TTS throw:", e);
         }
       }
 
@@ -1170,11 +1184,15 @@ Use this context to stay consistent. Do not read this back to the user.
         usedKnowledge,
         conversationId: conversationId || null,
         call_id: callId || null,
+        audio_expected,
       };
 
       if (audio && audio.audio_base64) {
         responseBody.audio_base64 = audio.audio_base64;
         responseBody.mime = audio.mime || "audio/mpeg";
+      } else if (audio_expected) {
+        responseBody.audio_missing = true;
+        if (audio_error) responseBody.audio_error = String(audio_error).slice(0, 180);
       }
 
       return responseBody;
