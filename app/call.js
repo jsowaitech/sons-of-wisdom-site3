@@ -14,8 +14,8 @@
 // - ✅ FIX (NEW): iOS-safe ring (uses unlocked shared audio element)
 // - ✅ FIX (NEW): VAD voice-hold before starting recording (prevents noise-trigger loops)
 // - ✅ FIX (NEW): Ignore tiny audio blobs before transcribe (prevents "couldn't hear you" loops)
-// - ✅ FIX (NEW): Status correctness during ring + greeting (Connecting… / AI replying… / then Listening…)
-// - ✅ FIX (CRITICAL iOS): PREWARM MIC PERMISSION inside the user gesture chain (prevents “stuck connecting”)
+// - ✅ FIX (NEW): Status correctness during ring + greeting (Ringing… / Greeting… / Listening…)
+// - ✅ FIX (CRITICAL iOS): PRIME mic + audio + AudioContexts inside the SAME user gesture (prevents “stuck connecting”)
 // - ✅ FIX (CRITICAL iOS): Create MediaElementSource ONLY ONCE (prevents InvalidStateError)
 
 const DEBUG = true;
@@ -70,6 +70,7 @@ let isMerging = false;
 
 /* audio recording */
 let globalStream = null;
+let micPromise = null; // ✅ PRIME getUserMedia within user gesture, await later
 let mediaRecorder = null;
 let recordChunks = [];
 let recordMimeType = "audio/webm";
@@ -174,8 +175,8 @@ let pausedInBackground = false;
 let transientStatus = "";
 let transientUntil = 0;
 
-/* ✅ Call phases so status never says "Listening" during ring/greeting */
-let callPhase = "idle"; // idle | connecting | greeting | live
+/* ✅ Call phases (premium polish) */
+let callPhase = "idle"; // idle | requesting_mic | ringing | greeting | live
 
 /* ---------- Helpers ---------- */
 function setStatus(t) {
@@ -191,7 +192,8 @@ function setTransientStatus(t, ms = 1600) {
 
 function renderStatus() {
   // Priority order:
-  // not calling > paused > connecting/greeting > AI speaking > transcribing > thinking > merging > transient > mic muted > live listening
+  // not calling > paused > phase-specific > AI speaking > transcribing > thinking > merging > transient > mic muted > live listening
+
   if (!isCalling) {
     setStatus("Tap the blue call button to begin.");
     return;
@@ -202,9 +204,19 @@ function renderStatus() {
     return;
   }
 
-  // ✅ NEW: Don't show "Listening" until we are truly live
-  if (callPhase === "connecting" || callPhase === "greeting") {
-    setStatus("Connecting…");
+  // Phase messaging first (prevents “Listening” during ring/greeting)
+  if (callPhase === "requesting_mic") {
+    setStatus("Requesting microphone…");
+    return;
+  }
+  if (callPhase === "ringing") {
+    setStatus("Ringing…");
+    return;
+  }
+  if (callPhase === "greeting") {
+    // If AI audio is actually playing, show that explicitly
+    if (isPlayingAI && !speakerMuted) setStatus("AI greeting…");
+    else setStatus("Connecting…");
     return;
   }
 
@@ -377,8 +389,11 @@ document.addEventListener("visibilitychange", async () => {
     renderStatus();
   } else {
     pausedInBackground = false;
-    await unlockAudioSystem();
-    callPhase = "connecting";
+    // iOS may suspend audio contexts in background—try to revive gently
+    await unlockAudioSystem().catch(() => {});
+    try {
+      if (vadAC?.state === "suspended") await vadAC.resume().catch(() => {});
+    } catch {}
     renderStatus();
   }
 });
@@ -411,46 +426,94 @@ function ensureSharedAudio() {
 }
 
 async function unlockAudioSystem() {
-  try {
-    ensureSharedAudio();
+  ensureSharedAudio();
 
-    playbackAC ||= new (window.AudioContext || window.webkitAudioContext)();
-    if (playbackAC.state === "suspended") {
-      await playbackAC.resume().catch(() => {});
-    }
+  playbackAC ||= new (window.AudioContext || window.webkitAudioContext)();
 
-    // ✅ IMPORTANT: Only create MediaElementSource ONCE per <audio> element.
-    // Safari iOS will throw InvalidStateError if you call createMediaElementSource twice for the same element.
-    if (!playbackSource) {
-      playbackSource = playbackAC.createMediaElementSource(ttsPlayer);
-    }
+  // Try to resume if suspended (some iOS cases)
+  if (playbackAC.state === "suspended") {
+    await playbackAC.resume().catch(() => {});
+  }
 
-    if (!playbackAnalyser) {
-      playbackAnalyser = playbackAC.createAnalyser();
-      playbackAnalyser.fftSize = 1024;
-      playbackData = new Uint8Array(playbackAnalyser.fftSize);
+  // ✅ IMPORTANT: Only create MediaElementSource ONCE per <audio> element.
+  if (!playbackSource) {
+    playbackSource = playbackAC.createMediaElementSource(ttsPlayer);
+  }
 
-      playbackSource.connect(playbackAnalyser);
-      playbackAnalyser.connect(playbackAC.destination);
-    }
+  if (!playbackAnalyser) {
+    playbackAnalyser = playbackAC.createAnalyser();
+    playbackAnalyser.fftSize = 1024;
+    playbackData = new Uint8Array(playbackAnalyser.fftSize);
 
-    // iOS: prime a play() once during user gesture
-    if (IS_IOS && !audioUnlocked) {
-      const a = ensureSharedAudio();
-      a.src =
-        "data:audio/mp3;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAACcQCA" +
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-      a.volume = 0;
+    playbackSource.connect(playbackAnalyser);
+    playbackAnalyser.connect(playbackAC.destination);
+  }
+
+  // iOS: prime a play() once during user gesture
+  if (IS_IOS && !audioUnlocked) {
+    const a = ensureSharedAudio();
+    a.src =
+      "data:audio/mp3;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAACcQCA" +
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    a.volume = 0;
+
+    // Don’t let a rejected play() break the chain
+    try {
+      // Important: call play() here; awaiting is okay, but gesture might be fragile.
+      // Even if it rejects, we still proceed.
       await a.play().catch(() => {});
       a.pause();
       a.currentTime = 0;
-      audioUnlocked = true;
-      log("✅ iOS audio unlocked");
-    } else {
-      audioUnlocked = true;
+    } catch {}
+
+    audioUnlocked = true;
+    log("✅ iOS audio unlocked");
+  } else {
+    audioUnlocked = true;
+  }
+}
+
+/* ✅ CRITICAL iOS: PRIME mic+audio+contexts in SAME user gesture */
+function primeIOSGesture() {
+  try {
+    ensureSharedAudio();
+
+    // Kick off unlock attempt (don’t await; just start it inside gesture)
+    // If it fails, later awaits will retry.
+    unlockAudioSystem().catch(() => {});
+
+    // Start mic permission request inside gesture, but don't block the handler
+    if (!micPromise && !globalStream) {
+      micPromise = navigator.mediaDevices
+        .getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        })
+        .then((s) => {
+          globalStream = s;
+          try {
+            globalStream.getAudioTracks().forEach((t) => (t.enabled = !micMuted));
+          } catch {}
+          return globalStream;
+        })
+        .catch((e) => {
+          micPromise = null;
+          throw e;
+        });
+    }
+
+    // Prime VAD AudioContext creation (resume later if needed)
+    if (!vadAC) {
+      vadAC = new (window.AudioContext || window.webkitAudioContext)();
+      if (vadAC.state === "suspended") {
+        vadAC.resume().catch(() => {});
+      }
     }
   } catch (e) {
-    warn("unlockAudioSystem failed", e);
+    warn("primeIOSGesture failed", e);
   }
 }
 
@@ -514,7 +577,12 @@ function stopRing() {
 
 /* ---------- MIME picking ---------- */
 function pickSupportedMime() {
-  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+  ];
   for (const m of candidates) {
     if (window.MediaRecorder && MediaRecorder.isTypeSupported?.(m)) return m;
   }
@@ -531,44 +599,61 @@ function mimeToExt(mime) {
 /* ---------- Mic stream ---------- */
 async function ensureMicStream() {
   if (globalStream) return globalStream;
+  if (micPromise) return micPromise;
 
-  globalStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    },
-  });
+  micPromise = navigator.mediaDevices
+    .getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    })
+    .then((s) => {
+      globalStream = s;
+      try {
+        globalStream.getAudioTracks().forEach((t) => (t.enabled = !micMuted));
+      } catch {}
+      return globalStream;
+    })
+    .finally(() => {
+      // keep micPromise for future awaits if globalStream is set
+      // if it failed, catch above will reset it
+    });
 
-  try {
-    globalStream.getAudioTracks().forEach((t) => (t.enabled = !micMuted));
-  } catch {}
-
-  return globalStream;
+  return micPromise;
 }
 
 /* ---------- VAD setup ---------- */
 async function setupVAD() {
-  if (vadAC) return;
-
-  vadAC = new (window.AudioContext || window.webkitAudioContext)();
+  // We may have created vadAC during primeIOSGesture()
+  if (!vadAC) {
+    vadAC = new (window.AudioContext || window.webkitAudioContext)();
+  }
   if (vadAC.state === "suspended") {
     await vadAC.resume().catch(() => {});
   }
 
+  if (vadAnalyser && vadSource && vadData) return;
+
   const stream = await ensureMicStream();
 
-  vadSource = vadAC.createMediaStreamSource(stream);
-  vadAnalyser = vadAC.createAnalyser();
-  vadAnalyser.fftSize = 1024;
-  vadData = new Uint8Array(vadAnalyser.fftSize);
+  try {
+    vadSource = vadAC.createMediaStreamSource(stream);
+    vadAnalyser = vadAC.createAnalyser();
+    vadAnalyser.fftSize = 1024;
+    vadData = new Uint8Array(vadAnalyser.fftSize);
 
-  vadSource.connect(vadAnalyser);
+    vadSource.connect(vadAnalyser);
 
-  noiseFloor = 0.012;
-  lastNoiseUpdate = performance.now();
+    noiseFloor = 0.012;
+    lastNoiseUpdate = performance.now();
 
-  log("✅ VAD ready (adaptive, phone-call pace)");
+    log("✅ VAD ready (adaptive, phone-call pace)");
+  } catch (e) {
+    warn("setupVAD failed", e);
+    throw e;
+  }
 }
 
 function rmsFromTimeDomain(bytes) {
@@ -582,8 +667,12 @@ function rmsFromTimeDomain(bytes) {
 
 function getMicEnergy() {
   if (!vadAnalyser || !vadData) return 0;
-  vadAnalyser.getByteTimeDomainData(vadData);
-  return rmsFromTimeDomain(vadData);
+  try {
+    vadAnalyser.getByteTimeDomainData(vadData);
+    return rmsFromTimeDomain(vadData);
+  } catch {
+    return 0;
+  }
 }
 
 function computeAdaptiveThreshold() {
@@ -661,7 +750,9 @@ async function transcribeTurn() {
     } catch {}
     transcribeAbort = new AbortController();
 
-    const blob = new Blob(recordChunks, { type: recordMimeType || "audio/webm" });
+    const blob = new Blob(recordChunks, {
+      type: recordMimeType || "audio/webm",
+    });
     const ext = mimeToExt(recordMimeType);
     const filename = `user.${ext}`;
 
@@ -678,11 +769,15 @@ async function transcribeTurn() {
 
     if (!resp.ok) {
       const t = await resp.text().catch(() => "");
-      throw new Error(`Transcribe HTTP ${resp.status}: ${t || resp.statusText}`);
+      throw new Error(
+        `Transcribe HTTP ${resp.status}: ${t || resp.statusText}`
+      );
     }
 
     const data = await resp.json().catch(() => ({}));
-    const text = (data?.text || data?.transcript || data?.utterance || "").toString().trim();
+    const text = (data?.text || data?.transcript || data?.utterance || "")
+      .toString()
+      .trim();
     return text;
   } catch (e) {
     if (e?.name === "AbortError") return "";
@@ -723,7 +818,10 @@ function queueMergedSend(transcript) {
 
     // DEDUPE (prevents multiple AI replies from same spoken line)
     const now = Date.now();
-    if (final === lastUserSentText && now - lastUserSentAt < USER_TURN_DEDUPE_MS) {
+    if (
+      final === lastUserSentText &&
+      now - lastUserSentAt < USER_TURN_DEDUPE_MS
+    ) {
       log("🟡 dropped duplicate user turn:", final);
       return;
     }
@@ -954,6 +1052,8 @@ async function playGreetingOnce() {
     if (b64) {
       await enqueueTTS(b64, mime);
 
+      // Ensure status reads like a greeting, not “Listening…”
+      // callPhase already set to "greeting" by startCall()
       if (!speakerMuted) {
         isPlayingAI = true;
         aiSpeechStart = performance.now();
@@ -969,6 +1069,7 @@ async function playGreetingOnce() {
     renderStatus();
   } catch (e) {
     warn("playGreetingOnce failed", e);
+    setTransientStatus("Couldn’t load greeting. Check network.", 1800);
     renderStatus();
   }
 }
@@ -1195,8 +1296,10 @@ async function startVADLoop() {
     if (debugOn) {
       setDebugText(
         `state=${vadState}  calling=${isCalling}  rec=${isRecording}\n` +
-          `AI=${isPlayingAI}  micMuted=${micMuted}  spkMuted=${speakerMuted}\n` +
-          `energy=${energy.toFixed(4)}  noise=${noiseFloor.toFixed(4)}  thr=${thr.toFixed(4)}\n` +
+          `phase=${callPhase}  AI=${isPlayingAI}  micMuted=${micMuted}  spkMuted=${speakerMuted}\n` +
+          `energy=${energy.toFixed(4)}  noise=${noiseFloor.toFixed(
+            4
+          )}  thr=${thr.toFixed(4)}\n` +
           `turnQ=${pendingUserTurns.length}  ttsQ=${ttsQueue.length}  epoch=${playbackEpoch}`
       );
     }
@@ -1338,15 +1441,18 @@ function stopTimer() {
 }
 
 /* ---------- Call controls ---------- */
-callBtn?.addEventListener("click", async () => {
-  await unlockAudioSystem(); // must be user gesture
+callBtn?.addEventListener("click", () => {
+  // ✅ MUST be synchronous to preserve iOS user-gesture privileges:
+  // prime mic permission + audio context + unlock attempt right here.
+  primeIOSGesture();
+
+  // Now run the async flow (gesture priming already happened)
   if (!isCalling) startCall();
   else endCall();
 });
 
 async function startCall() {
   isCalling = true;
-  callPhase = "connecting";
   pausedInBackground = false;
   clearTranscript();
 
@@ -1377,39 +1483,35 @@ async function startCall() {
   isMerging = false;
   vadStartCandidateAt = 0;
 
-  // ✅ important: do NOT start mic/VAD until ring has played twice
   startTimer();
-  renderStatus();
 
   try {
-    // ✅ CRITICAL iOS FIX:
-    // Prewarm mic permission RIGHT NOW (still in user gesture chain),
-    // so iOS Safari doesn't hang/deny when we ask later after awaits.
-    setTransientStatus("Requesting mic…", 1200);
+    // 1) Request mic (await after prime; if already primed, resolves quickly)
+    callPhase = "requesting_mic";
+    renderStatus();
     await ensureMicStream();
 
-    // Ring plays twice BEFORE VAD/recording (we already have the stream, but we won't record yet)
+    // 2) Ring
+    callPhase = "ringing";
+    renderStatus();
     await playRingTwiceOnConnect();
 
-    // Now bring up VAD + visuals
+    // 3) Bring up VAD + visuals
     await setupVAD();
     setupRingCanvas();
     if (!ringRAF) drawRings();
 
-    // ✅ Greeting phase
+    // 4) Greeting
     callPhase = "greeting";
     renderStatus();
-
-    // Greeting (TTS)
     await playGreetingOnce();
 
-    // extra determinism: ensure greeting drained before listening
+    // Ensure greeting drained before listening
     if (!speakerMuted) await drainTTSQueue();
 
-    // ✅ only now we are truly live
+    // 5) Live
     callPhase = "live";
     renderStatus();
-
     await startVADLoop();
   } catch (e) {
     warn("startCall error", e);
@@ -1437,8 +1539,7 @@ function closeAudioContexts() {
 
   // ✅ IMPORTANT iOS FIX:
   // Do NOT close the playback AudioContext (and do NOT recreate MediaElementSource).
-  // Closing and rebuilding is a common source of Safari InvalidStateError.
-  // Instead, just suspend it to reduce CPU/battery.
+  // Instead, suspend it to reduce CPU/battery.
   try {
     playbackAC?.suspend?.();
   } catch {}
@@ -1494,6 +1595,7 @@ function endCall() {
     globalStream?.getTracks().forEach((t) => t.stop());
   } catch {}
   globalStream = null;
+  micPromise = null;
 
   try {
     if (ttsPlayer) {
@@ -1514,5 +1616,5 @@ function endCall() {
 ensureSharedAudio();
 renderStatus();
 log(
-  "✅ call.js loaded: iOS mic prewarm + single MediaElementSource + CONNECTING status during ring+greeting + iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + STATUS RENDER FIX + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
+  "✅ call.js loaded: iOS gesture priming (mic+audio+contexts) + single MediaElementSource + PREMIUM status phases (Requesting mic / Ringing / Greeting / Listening) + iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
 );
