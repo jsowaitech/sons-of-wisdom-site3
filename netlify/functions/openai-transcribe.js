@@ -1,42 +1,48 @@
 // netlify/functions/openai-transcribe.js
 // Son of Wisdom — OpenAI Transcribe proxy (Netlify Function, Node 18+)
-//
-// Accepts: multipart/form-data from browser (FormData)
-// - Looks for an audio file field named: "audio" (preferred) or "file"
-// - Forwards to OpenAI /v1/audio/transcriptions
-// - Returns: { text }
-//
-// ENV:
-// - OPENAI_API_KEY (required)
-// - OPENAI_TRANSCRIBE_MODEL (optional, default: "gpt-4o-mini-transcribe")
-//
-// Notes:
-// - Uses busboy to parse multipart in Netlify Functions reliably.
-// - Uses native fetch/FormData/Blob (Node 18+).
 
 import Busboy from "busboy";
+
+function withTimeout(ms) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), ms);
+  return { signal: ac.signal, clear: () => clearTimeout(t) };
+}
+
+function normalizeMime(m) {
+  const mime = String(m || "").toLowerCase();
+  if (
+    mime.includes("mp4") ||
+    mime.includes("m4a") ||
+    mime.includes("quicktime")
+  ) {
+    return "audio/mp4";
+  }
+  if (mime.includes("ogg")) return "audio/ogg";
+  return mime || "audio/webm";
+}
 
 export const handler = async (event) => {
   const cors = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
   };
 
-  // Preflight
+  const jsonHeaders = {
+    ...cors,
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store",
+  };
+
   if (event.httpMethod === "OPTIONS") {
-    return {
-      statusCode: 204,
-      headers: { ...cors, "Cache-Control": "no-store" },
-      body: "",
-    };
+    return { statusCode: 204, headers: jsonHeaders, body: "" };
   }
 
-  // Only POST
   if (event.httpMethod !== "POST") {
     return {
       statusCode: 405,
-      headers: { ...cors, "Content-Type": "application/json" },
+      headers: jsonHeaders,
       body: JSON.stringify({ error: "Method not allowed" }),
     };
   }
@@ -45,12 +51,13 @@ export const handler = async (event) => {
   if (!apiKey) {
     return {
       statusCode: 500,
-      headers: { ...cors, "Content-Type": "application/json" },
+      headers: jsonHeaders,
       body: JSON.stringify({ error: "Missing OPENAI_API_KEY env var" }),
     };
   }
 
-  const MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
+  const MODEL =
+    process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
 
   try {
     const contentType =
@@ -59,12 +66,11 @@ export const handler = async (event) => {
     if (!String(contentType).includes("multipart/form-data")) {
       return {
         statusCode: 400,
-        headers: { ...cors, "Content-Type": "application/json" },
+        headers: jsonHeaders,
         body: JSON.stringify({ error: "Expected multipart/form-data" }),
       };
     }
 
-    // Parse multipart
     const bb = Busboy({ headers: { "content-type": contentType } });
 
     let audioBuffer = null;
@@ -73,9 +79,7 @@ export const handler = async (event) => {
     let gotFileField = "";
 
     bb.on("file", (fieldname, file, info) => {
-      // We accept "audio" or "file" (browser may send either)
       if (fieldname !== "audio" && fieldname !== "file") {
-        // Drain unused file streams to avoid hanging
         file.resume();
         return;
       }
@@ -93,9 +97,6 @@ export const handler = async (event) => {
       });
     });
 
-    // (Optional) collect fields
-    bb.on("field", (_name, _val) => {});
-
     const finished = new Promise((resolve, reject) => {
       bb.on("finish", resolve);
       bb.on("error", reject);
@@ -111,86 +112,92 @@ export const handler = async (event) => {
     if (!audioBuffer || !audioBuffer.length) {
       return {
         statusCode: 400,
-        headers: { ...cors, "Content-Type": "application/json" },
+        headers: jsonHeaders,
         body: JSON.stringify({
           error: "Missing audio file",
-          hint: "Send multipart/form-data with a file field named 'audio' (preferred) or 'file'.",
+          hint: "Send multipart/form-data with 'audio' or 'file'.",
         }),
       };
     }
 
-    // ✅ NEW: reject ultra-tiny audio uploads (prevents rapid “couldn’t hear you” loops)
-    // (tune threshold if needed)
+    // Tiny blob guard
     if (audioBuffer.length < 8000) {
       return {
         statusCode: 200,
-        headers: {
-          ...cors,
-          "Content-Type": "application/json",
-          "Cache-Control": "no-store",
-        },
+        headers: jsonHeaders,
         body: JSON.stringify({
           text: "",
           skipped: true,
           reason: "audio_too_small",
           bytes: audioBuffer.length,
-          received_file_field: gotFileField || null,
-          received_mime: audioMime,
         }),
       };
     }
 
-    // Build OpenAI form-data
+    // Normalize MIME for Safari
+    audioMime = normalizeMime(audioMime);
+
     const fd = new FormData();
-    fd.append("file", new Blob([audioBuffer], { type: audioMime }), audioFilename);
+    fd.append(
+      "file",
+      new Blob([audioBuffer], { type: audioMime }),
+      audioFilename
+    );
     fd.append("model", MODEL);
 
-    // Optional: enforce JSON response shape
-    // fd.append("response_format", "json");
+    const timeout = withTimeout(25000); // ✅ 25s hard limit
 
-    // Optional language hint:
-    // fd.append("language", "en");
-
-    const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: fd,
-    });
+    let resp;
+    try {
+      resp = await fetch(
+        "https://api.openai.com/v1/audio/transcriptions",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: fd,
+          signal: timeout.signal,
+        }
+      );
+    } finally {
+      timeout.clear();
+    }
 
     if (!resp.ok) {
       const txt = await resp.text().catch(() => "");
       return {
         statusCode: resp.status,
-        headers: { ...cors, "Content-Type": "application/json" },
+        headers: jsonHeaders,
         body: JSON.stringify({
           error: "OpenAI transcribe failed",
           details: txt || resp.statusText,
           model: MODEL,
-          received_file_field: gotFileField || null,
-          received_mime: audioMime,
         }),
       };
     }
 
     const data = await resp.json().catch(() => ({}));
+
     return {
       statusCode: 200,
-      headers: {
-        ...cors,
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-      },
-      body: JSON.stringify({ text: data?.text || "" }),
+      headers: jsonHeaders,
+      body: JSON.stringify({
+        text: data?.text || "",
+      }),
     };
   } catch (e) {
+    const msg =
+      e?.name === "AbortError"
+        ? "Transcription timeout"
+        : String(e?.message || e);
+
     return {
       statusCode: 500,
-      headers: { ...cors, "Content-Type": "application/json" },
+      headers: jsonHeaders,
       body: JSON.stringify({
         error: "Server error",
-        details: String(e?.message || e),
+        details: msg,
       }),
     };
   }

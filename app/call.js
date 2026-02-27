@@ -6,16 +6,17 @@
 // - Single renderStatus (fix status race)
 // - MIME-correct transcription (MediaRecorder mime -> correct file ext)
 // - Keep TTS queued while speaker muted
-// - Close/suspend audio contexts safely on endCall (iOS reliability)
+// - Close AudioContexts on endCall (iOS leak prevention)  <-- adjusted: DO NOT close playback AC on iOS
 // - Reset VAD/merge state on background
-// - Transcript panel autoscrolls the real scroller (#tsList)
-// - Ring plays TWICE before mic/VAD starts (mic is OFF during ring)
-// - Less sensitive VAD (higher thresholds + stronger hysteresis)
-// - iOS-safe ring (uses unlocked shared audio element)
-// - VAD voice-hold before starting recording (prevents noise-trigger loops)
-// - Ignore tiny audio blobs before transcribe (prevents "couldn't hear you" loops)
-// - Status correctness during ring + greeting (Connecting… / AI replying… / then Listening…)
-// - ✅ iOS MediaRecorder MIME fallback + normalize audio_mime/mime
+// - ✅ FIX: Transcript panel autoscrolls the real scroller (#tsList) so lines keep showing
+// - ✅ FIX: Ring plays TWICE before mic/VAD starts (mic is OFF during ring)  <-- still true: mic stream is prewarmed, but VAD/recording starts after ring
+// - ✅ FIX: Less sensitive VAD (higher thresholds + stronger hysteresis)
+// - ✅ FIX (NEW): iOS-safe ring (uses unlocked shared audio element)
+// - ✅ FIX (NEW): VAD voice-hold before starting recording (prevents noise-trigger loops)
+// - ✅ FIX (NEW): Ignore tiny audio blobs before transcribe (prevents "couldn't hear you" loops)
+// - ✅ FIX (NEW): Status correctness during ring + greeting (Connecting… / AI replying… / then Listening…)
+// - ✅ FIX (CRITICAL iOS): PREWARM MIC PERMISSION inside the user gesture chain (prevents “stuck connecting”)
+// - ✅ FIX (CRITICAL iOS): Create MediaElementSource ONLY ONCE (prevents InvalidStateError)
 
 const DEBUG = true;
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -122,6 +123,7 @@ const IS_IOS =
 /* ---------- Shared AI audio player + analyser ---------- */
 let ttsPlayer = null;
 let playbackAC = null;
+let playbackSource = null; // ✅ IMPORTANT: only create MediaElementSource once
 let playbackAnalyser = null;
 let playbackData = null;
 let audioUnlocked = false;
@@ -200,7 +202,7 @@ function renderStatus() {
     return;
   }
 
-  // ✅ Don't show "Listening" until we are truly live
+  // ✅ NEW: Don't show "Listening" until we are truly live
   if (callPhase === "connecting" || callPhase === "greeting") {
     setStatus("Connecting…");
     return;
@@ -410,21 +412,25 @@ function ensureSharedAudio() {
 
 async function unlockAudioSystem() {
   try {
-    if (!ttsPlayer) ensureSharedAudio();
+    ensureSharedAudio();
 
     playbackAC ||= new (window.AudioContext || window.webkitAudioContext)();
     if (playbackAC.state === "suspended") {
       await playbackAC.resume().catch(() => {});
     }
 
-    // IMPORTANT: Only create MediaElementSource ONCE per audio element per AudioContext
+    // ✅ IMPORTANT: Only create MediaElementSource ONCE per <audio> element.
+    // Safari iOS will throw InvalidStateError if you call createMediaElementSource twice for the same element.
+    if (!playbackSource) {
+      playbackSource = playbackAC.createMediaElementSource(ttsPlayer);
+    }
+
     if (!playbackAnalyser) {
-      const src = playbackAC.createMediaElementSource(ttsPlayer);
       playbackAnalyser = playbackAC.createAnalyser();
       playbackAnalyser.fftSize = 1024;
       playbackData = new Uint8Array(playbackAnalyser.fftSize);
 
-      src.connect(playbackAnalyser);
+      playbackSource.connect(playbackAnalyser);
       playbackAnalyser.connect(playbackAC.destination);
     }
 
@@ -468,8 +474,7 @@ async function playRingTwiceOnConnect() {
         a.currentTime = 0;
       } catch {}
 
-      // ✅ respect speaker mute
-      a.muted = speakerMuted;
+      a.muted = false;
       a.volume = speakerMuted ? 0 : 1;
       a.playsInline = true;
       a.src = "ring.mp3";
@@ -509,26 +514,16 @@ function stopRing() {
 
 /* ---------- MIME picking ---------- */
 function pickSupportedMime() {
-  // iOS Safari MediaRecorder support is picky; prefer mp4 if supported.
-  const isIOS =
-    /iPad|iPhone|iPod/i.test(navigator.userAgent || "") ||
-    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-
-  const candidates = isIOS
-    ? ["audio/mp4;codecs=mp4a.40.2", "audio/mp4", "audio/m4a"]
-    : ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
-
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
   for (const m of candidates) {
     if (window.MediaRecorder && MediaRecorder.isTypeSupported?.(m)) return m;
   }
-
-  // Let the browser choose if nothing matches
-  return undefined;
+  return "audio/webm";
 }
 
 function mimeToExt(mime) {
   const m = (mime || "").toLowerCase();
-  if (m.includes("mp4") || m.includes("m4a")) return "m4a";
+  if (m.includes("mp4")) return "m4a";
   if (m.includes("ogg")) return "ogg";
   return "webm";
 }
@@ -613,20 +608,12 @@ function maybeUpdateNoiseFloor(energy, now) {
 /* ---------- RECORD TURN CONTROL ---------- */
 async function startRecordingTurn() {
   if (isRecording) return;
-
   const stream = await ensureMicStream();
   const mimeType = pickSupportedMime();
 
+  recordMimeType = mimeType;
   recordChunks = [];
-
-  try {
-    mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-  } catch (err) {
-    warn("MediaRecorder init failed, retrying without mimeType", err);
-    mediaRecorder = new MediaRecorder(stream);
-  }
-
-  recordMimeType = mediaRecorder.mimeType || mimeType || "audio/webm";
+  mediaRecorder = new MediaRecorder(stream, { mimeType });
   isRecording = true;
 
   mediaRecorder.ondataavailable = (e) => {
@@ -679,7 +666,6 @@ async function transcribeTurn() {
     const filename = `user.${ext}`;
 
     const fd = new FormData();
-    // server accepts "audio" (preferred) or "file"
     fd.append("audio", blob, filename);
     fd.append("model", TRANSCRIBE_MODEL);
     fd.append("response_format", "json");
@@ -696,9 +682,7 @@ async function transcribeTurn() {
     }
 
     const data = await resp.json().catch(() => ({}));
-    const text = (data?.text || data?.transcript || data?.utterance || "")
-      .toString()
-      .trim();
+    const text = (data?.text || data?.transcript || data?.utterance || "").toString().trim();
     return text;
   } catch (e) {
     if (e?.name === "AbortError") return "";
@@ -803,7 +787,6 @@ async function drainTTSQueue() {
       if (!isCalling) break;
 
       if (!ok) {
-        // Without overlay: just hint briefly and keep going.
         setTransientStatus("Audio blocked. Tap Call again.", 1800);
         renderStatus();
       } else {
@@ -964,14 +947,13 @@ async function playGreetingOnce() {
 
     const replyText = (data?.assistant_text || data?.text || "").trim();
     const b64 = data?.audio_base64;
-    const mime = data?.mime || data?.audio_mime || "audio/mpeg";
+    const mime = data?.mime || "audio/mpeg";
 
     if (replyText) addFinalLine("AI: " + replyText);
 
     if (b64) {
       await enqueueTTS(b64, mime);
 
-      // ✅ Make status match reality: AI is about to speak
       if (!speakerMuted) {
         isPlayingAI = true;
         aiSpeechStart = performance.now();
@@ -1034,7 +1016,7 @@ async function sendTranscriptToCoachAndQueueAudio(transcript) {
     if (replyText) addFinalLine("AI: " + replyText);
 
     const b64 = data?.audio_base64;
-    const mime = data?.mime || data?.audio_mime || "audio/mpeg";
+    const mime = data?.mime || "audio/mpeg";
 
     if (b64) await enqueueTTS(b64, mime);
 
@@ -1116,7 +1098,6 @@ async function startVADLoop() {
     const contThr = thr * VAD_CONT_MULT;
 
     // If AI is speaking and speaker is ON, do NOT start recording from echo.
-    // We only allow a barge-in if voice is sustained and clearly louder than threshold.
     const allowVADStart = !(isPlayingAI && !speakerMuted);
 
     const isVoiceStart = !micMuted && energy > startThr;
@@ -1401,10 +1382,16 @@ async function startCall() {
   renderStatus();
 
   try {
-    // Ring plays twice BEFORE mic/VAD (mic is still OFF here)
+    // ✅ CRITICAL iOS FIX:
+    // Prewarm mic permission RIGHT NOW (still in user gesture chain),
+    // so iOS Safari doesn't hang/deny when we ask later after awaits.
+    setTransientStatus("Requesting mic…", 1200);
+    await ensureMicStream();
+
+    // Ring plays twice BEFORE VAD/recording (we already have the stream, but we won't record yet)
     await playRingTwiceOnConnect();
 
-    // Now bring up mic + VAD + visuals
+    // Now bring up VAD + visuals
     await setupVAD();
     setupRingCanvas();
     if (!ringRAF) drawRings();
@@ -1432,6 +1419,7 @@ async function startCall() {
 }
 
 function closeAudioContexts() {
+  // VAD chain can be safely closed on endCall.
   try {
     vadSource?.disconnect();
   } catch {}
@@ -1447,15 +1435,13 @@ function closeAudioContexts() {
   } catch {}
   vadAC = null;
 
-  // ✅ SAFER FOR SAFARI:
-  // Do NOT close playbackAC (can break MediaElementSource graph on next call).
-  // Suspend it instead.
+  // ✅ IMPORTANT iOS FIX:
+  // Do NOT close the playback AudioContext (and do NOT recreate MediaElementSource).
+  // Closing and rebuilding is a common source of Safari InvalidStateError.
+  // Instead, just suspend it to reduce CPU/battery.
   try {
-    if (playbackAC && playbackAC.state !== "closed") playbackAC.suspend();
+    playbackAC?.suspend?.();
   } catch {}
-
-  playbackAnalyser = null;
-  playbackData = null;
 }
 
 function endCall() {
@@ -1528,5 +1514,5 @@ function endCall() {
 ensureSharedAudio();
 renderStatus();
 log(
-  "✅ call.js loaded: iOS-safe MediaRecorder MIME fallback + normalize audio_mime/mime + CONNECTING status during ring+greeting + iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + STATUS RENDER FIX + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
+  "✅ call.js loaded: iOS mic prewarm + single MediaElementSource + CONNECTING status during ring+greeting + iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + STATUS RENDER FIX + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
 );
