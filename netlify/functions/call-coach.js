@@ -19,6 +19,13 @@
 // ✅ audio_expected: tells client we attempted/expected audio
 // ✅ audio_missing: tells client audio did not arrive
 // ✅ audio_error: short diagnostic string for logging/UI
+//
+// NEW (TIMEOUT HARDENING):
+// ✅ Aborts OpenAI + ElevenLabs calls early to avoid Netlify 30s function timeout
+// ✅ Keeps response fast even on slow internet / upstream stalls
+//
+// NEW (TTS TEXT CLAMP IMPROVED):
+// ✅ Preserves paragraph breaks (newlines) while still removing markdown symbols
 
 const { Pinecone } = require("@pinecone-database/pinecone");
 const crypto = require("crypto");
@@ -58,6 +65,24 @@ const noStoreHeaders = {
   "Content-Type": "application/json",
   "Cache-Control": "no-store",
 };
+
+// ---------- Timeouts (avoid Netlify hard timeout) ----------
+const OPENAI_TIMEOUT_MS = 16000; // chat + embed calls
+const ELEVEN_TIMEOUT_MS = 11000; // TTS call
+const SUPABASE_TIMEOUT_MS = 8000;
+const PINECONE_OVERALL_BUDGET_MS = 16000;
+
+// ---------- fetch helper with timeout ----------
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 // ---------- Anti-repeat memory (in-memory per warm lambda) ----------
 const NO_RESPONSE_MEMORY = new Map(); // key: callId|deviceId => { nudges:[], ends:[] }
@@ -671,32 +696,52 @@ function safeJsonParse(s, fallback = {}) {
   }
 }
 
-// Keep output TTS-safe + bounded
-function clampTtsSafe(text, maxChars = 900) {
-  const s = String(text || "")
-    .replace(/[#*_>`]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+// Keep output TTS-safe + bounded (preserve paragraph breaks)
+function clampTtsSafe(text, maxChars = 1200) {
+  let s = String(text || "");
+
+  // normalize newlines
+  s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+  // remove markdown-ish symbols
+  s = s.replace(/[#*_>`]/g, "");
+
+  // trim each line and collapse internal spaces, but keep line breaks
+  s = s
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .join("\n");
+
+  // collapse too many blank lines
+  s = s.replace(/\n{3,}/g, "\n\n").trim();
+
   if (!s) return "";
   if (s.length <= maxChars) return s;
-  return s.slice(0, maxChars - 1).trim() + "…";
+
+  // truncate safely
+  const cut = s.slice(0, maxChars - 1).trim();
+  return cut + "…";
 }
 
 // ---------- OpenAI helpers ----------
 async function openaiEmbedding(text) {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
-  const res = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+  const res = await fetchWithTimeout(
+    "https://api.openai.com/v1/embeddings",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_EMBED_MODEL,
+        input: String(text || "").slice(0, 8000),
+      }),
     },
-    body: JSON.stringify({
-      model: OPENAI_EMBED_MODEL,
-      input: String(text || "").slice(0, 8000),
-    }),
-  });
+    OPENAI_TIMEOUT_MS
+  );
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
@@ -721,14 +766,18 @@ async function openaiChat(messages, opts = {}) {
   };
   if (opts.maxTokens) body.max_tokens = opts.maxTokens;
 
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+  const res = await fetchWithTimeout(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify(body),
-  });
+    OPENAI_TIMEOUT_MS
+  );
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
@@ -747,11 +796,15 @@ function buildKBQuery(userMessage) {
 }
 
 async function getKnowledgeContext(question, topK = 10) {
+  const started = Date.now();
   try {
     const index = ensurePinecone();
     if (!index || !question) return "";
 
     const vector = await openaiEmbedding(question);
+
+    // Soft budget check
+    if (Date.now() - started > PINECONE_OVERALL_BUDGET_MS) return "";
 
     const target =
       PINECONE_NAMESPACE && typeof index.namespace === "function"
@@ -799,6 +852,7 @@ Do not introduce synonyms, alternate labels, or new named concepts.
 Keep it TTS-safe plain text.
 No bullets, no numbering, no markdown, no emojis.
 Keep the meaning, but conform the wording to the knowledge base.
+Preserve short paragraphs with blank lines when helpful.
 `.trim(),
     },
     {
@@ -815,6 +869,7 @@ Keep the meaning, but conform the wording to the knowledge base.
     temperature: 0.2,
     presence_penalty: 0.1,
     frequency_penalty: 0.1,
+    maxTokens: 420,
   });
 
   return clampTtsSafe(rewritten || draft, 1200);
@@ -829,15 +884,19 @@ async function supaFetch(path, { method = "GET", headers = {}, query, body } = {
     for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
   }
 
-  const res = await fetch(url.toString(), {
-    method,
-    headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      ...headers,
+  const res = await fetchWithTimeout(
+    url.toString(),
+    {
+      method,
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        ...headers,
+      },
+      body,
     },
-    body,
-  });
+    SUPABASE_TIMEOUT_MS
+  );
 
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
@@ -933,19 +992,23 @@ async function elevenLabsTTS(text) {
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`;
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "xi-api-key": ELEVENLABS_API_KEY,
-      "Content-Type": "application/json",
-      Accept: "audio/mpeg",
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify({
+        text: trimmed,
+        model_id: "eleven_turbo_v2",
+        voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+      }),
     },
-    body: JSON.stringify({
-      text: trimmed,
-      model_id: "eleven_turbo_v2",
-      voice_settings: { stability: 0.5, similarity_boost: 0.8 },
-    }),
-  });
+    ELEVEN_TIMEOUT_MS
+  );
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
@@ -1116,17 +1179,31 @@ Use this context to stay consistent. Do not read this back to the user.
 
       messages.push({ role: "user", content: userMessageForAI });
 
-      const rawReply = await openaiChat(messages, {
-        temperature: 0.75,
-        presence_penalty: 0.45,
-        frequency_penalty: 0.4,
-      });
+      let rawReply = "";
+      try {
+        rawReply = await openaiChat(messages, {
+          temperature: 0.75,
+          presence_penalty: 0.45,
+          frequency_penalty: 0.4,
+          maxTokens: 520,
+        });
+      } catch (e) {
+        // Fast fallback on OpenAI timeout/downstream stall
+        console.error("[call-coach] OpenAI chat error:", e);
+        rawReply =
+          "I’m here with you. Say that again in one clear sentence, and tell me what happened right before it.";
+      }
 
-      // TTS-safe clamp
+      // TTS-safe clamp (preserve paragraphs)
       let reply = clampTtsSafe(rawReply, 1200);
 
       // 🔒 Enforce KB lexicon with a rewrite pass (only if KB exists)
-      reply = await rewriteToKbLexicon(reply, kbContext);
+      try {
+        reply = await rewriteToKbLexicon(reply, kbContext);
+      } catch (e) {
+        console.error("[call-coach] rewriteToKbLexicon error:", e);
+        reply = clampTtsSafe(reply, 1200);
+      }
 
       // Supabase logging (optional)
       if (SUPABASE_REST && SUPABASE_SERVICE_ROLE_KEY) {
