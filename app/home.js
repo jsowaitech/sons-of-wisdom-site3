@@ -5,6 +5,7 @@
 // ✅ Audio playback in Home chat, iOS Safari-safe
 // ✅ "Voice replies" toggle defaults OFF
 // ✅ Speak button records -> transcribes (multipart) -> shows interim bubble -> replaces with transcript -> sends to AI -> AI replies with text + voice
+// ✅ Files button opens file picker -> uploads to Netlify function upload-file -> shows result bubble
 
 sessionStorage.removeItem("sow_redirected");
 
@@ -17,6 +18,7 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 /* ------------------------------ config -------------------------------- */
 const CHAT_URL = "/.netlify/functions/call-coach";
 const TRANSCRIBE_URL = "/.netlify/functions/openai-transcribe";
+const UPLOAD_URL = "/.netlify/functions/upload-file";
 
 // DEV toggle: call OpenAI directly from the browser (no server).
 // ⚠️ For development ONLY — never enable this on production.
@@ -134,7 +136,7 @@ async function playAudioUrl(url) {
 }
 
 /* Render a message bubble + optional "Play" fallback button */
-function appendBubble(role, text, { audio } = {}) {
+function appendBubble(role, text, { audio, file } = {}) {
   if (!refs.chatBox) return null;
 
   const wrap = document.createElement("div");
@@ -144,6 +146,23 @@ function appendBubble(role, text, { audio } = {}) {
   msg.className = "bubble-text";
   msg.textContent = text || "";
   wrap.appendChild(msg);
+
+  if (file?.url) {
+    const row = document.createElement("div");
+    row.className = "bubble-audio-row";
+
+    const a = document.createElement("a");
+    a.href = file.url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = file.label || "Open file";
+    a.style.color = "inherit";
+    a.style.textDecoration = "underline";
+    a.style.fontSize = "0.95em";
+
+    row.appendChild(a);
+    wrap.appendChild(row);
+  }
 
   if (audio?.url) {
     const row = document.createElement("div");
@@ -167,7 +186,7 @@ function appendBubble(role, text, { audio } = {}) {
   return { wrap, msg };
 }
 
-// ✅ NEW: replace an existing bubble's text
+// ✅ replace an existing bubble's text
 function updateBubbleText(bubbleRef, newText) {
   try {
     if (!bubbleRef?.msg) return;
@@ -228,6 +247,8 @@ function setSendingState(v) {
     refs.sendBtn.textContent = sending ? "Sending…" : "Send";
   }
   if (refs.input && !recording) refs.input.disabled = sending;
+  if (refs.speakBtn) refs.speakBtn.disabled = sending;
+  if (refs.filesBtn) refs.filesBtn.disabled = sending;
 }
 
 function ensureChatScroll() {
@@ -365,6 +386,50 @@ async function transcribeAudioBlobMultipart(blob, mime) {
 
   const data = await res.json().catch(() => ({}));
   return String(data.text || "").trim();
+}
+
+/* ---------------------- file upload (multipart) ---------------------- */
+function pickFileFromUser({ accept = "", multiple = false } = {}) {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = accept || "";
+    input.multiple = !!multiple;
+    input.style.display = "none";
+    document.body.appendChild(input);
+
+    input.onchange = () => {
+      const files = Array.from(input.files || []);
+      try {
+        document.body.removeChild(input);
+      } catch {}
+      resolve(files);
+    };
+
+    input.click();
+  });
+}
+
+async function uploadFileMultipart(file, meta = {}) {
+  const fd = new FormData();
+  fd.append("file", file, file.name || "upload.bin");
+
+  // helpful metadata (optional)
+  if (meta.user_id) fd.append("user_id", meta.user_id);
+  if (meta.conversation_id) fd.append("conversation_id", meta.conversation_id);
+  if (meta.device_id) fd.append("device_id", meta.device_id);
+  if (meta.page) fd.append("page", meta.page);
+  if (meta.timestamp) fd.append("timestamp", meta.timestamp);
+
+  const res = await fetch(UPLOAD_URL, { method: "POST", body: fd });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Upload ${res.status}: ${t || res.statusText}`);
+  }
+
+  const data = await res.json().catch(() => ({}));
+  return data;
 }
 
 /* ------------------------------ actions ------------------------------- */
@@ -566,6 +631,59 @@ function stopRecording() {
   setStatus("Processing audio…");
 }
 
+/* ------------------------------ FILES (pick -> upload) ------------------------------ */
+async function handleFilesUpload() {
+  if (sending) return;
+
+  await unlockAudioSystem();
+
+  const files = await pickFileFromUser({
+    accept: "", // allow anything; you can restrict like ".pdf,.png,.jpg,.txt,.doc,.docx"
+    multiple: false,
+  });
+
+  const file = files?.[0];
+  if (!file) return;
+
+  // show user bubble
+  const interimBubble = appendBubble("user", `Uploading: ${file.name}…`);
+  setSendingState(true);
+  setStatus("Uploading file…");
+
+  try {
+    const data = await uploadFileMultipart(file, {
+      user_id: session?.user?.id || "",
+      conversation_id: conversationId || "",
+      device_id: localStorage.getItem("sow_device_id") || "",
+      page: "home",
+      timestamp: new Date().toISOString(),
+    });
+
+    const publicUrl = data?.public_url || data?.url || "";
+    const nice = data?.filename ? data.filename : file.name;
+
+    updateBubbleText(interimBubble, `Uploaded: ${nice}`);
+
+    // show AI bubble with link if available
+    if (publicUrl) {
+      appendBubble("ai", "File uploaded. Tell me what you want to do with it (summarize, extract key points, etc.).", {
+        file: { url: publicUrl, label: "Open uploaded file" },
+      });
+    } else {
+      appendBubble("ai", "File uploaded. Tell me what you want to do with it (summarize, extract key points, etc.).");
+    }
+
+    setStatus("Ready.");
+  } catch (err) {
+    console.error("[HOME] upload error:", err);
+    updateBubbleText(interimBubble, `Upload failed: ${file.name}`);
+    appendBubble("ai", "Sorry — file upload failed. Please try again.");
+    setStatus("Upload failed. Please try again.", true);
+  } finally {
+    setSendingState(false);
+  }
+}
+
 /* -------------------------- tooltips (guides) -------------------------- */
 function isTouchLike() {
   return (
@@ -709,9 +827,8 @@ function bindUI() {
     window.location.href = url.toString();
   });
 
-  refs.filesBtn?.addEventListener("click", async () => {
-    alert("Files: connect your upload flow here.");
-  });
+  // ✅ Files now opens picker + uploads
+  refs.filesBtn?.addEventListener("click", handleFilesUpload);
 
   refs.speakBtn?.addEventListener("click", async () => {
     if (sending) return;
