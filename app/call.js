@@ -17,6 +17,7 @@
 // - ✅ FIX (NEW): Status correctness during ring + greeting (Ringing… / Greeting… / Listening…)
 // - ✅ FIX (CRITICAL iOS): PRIME mic + audio + AudioContexts inside the SAME user gesture (prevents “stuck connecting”)
 // - ✅ FIX (CRITICAL iOS): Create MediaElementSource ONLY ONCE (prevents InvalidStateError)
+// - ✅ PREMIUM PRESENCE (NEW): “Blake has joined” moment + “Blake speaking…” + soft handoff to Listening
 
 const DEBUG = true;
 const log = (...a) => DEBUG && console.log("[SOW]", ...a);
@@ -175,8 +176,12 @@ let pausedInBackground = false;
 let transientStatus = "";
 let transientUntil = 0;
 
-/* ✅ Call phases (premium polish) */
-let callPhase = "idle"; // idle | requesting_mic | ringing | greeting | live
+/* ✅ Call phases (premium presence) */
+let callPhase = "idle"; // idle | requesting_mic | ringing | joined | greeting | live
+
+/* ✅ Premium presence micro-timing */
+const PRESENCE_JOIN_MS = 420;   // small intentional moment after ring
+const PRESENCE_HANDOFF_MS = 1200; // “Blake is here. Go ahead…” before Listening
 
 /* ---------- Helpers ---------- */
 function setStatus(t) {
@@ -192,7 +197,7 @@ function setTransientStatus(t, ms = 1600) {
 
 function renderStatus() {
   // Priority order:
-  // not calling > paused > phase-specific > AI speaking > transcribing > thinking > merging > transient > mic muted > live listening
+  // not calling > paused > phase-specific > Blake speaking > transcribing > thinking > merging > transient > mic muted > live listening
 
   if (!isCalling) {
     setStatus("Tap the blue call button to begin.");
@@ -206,22 +211,25 @@ function renderStatus() {
 
   // Phase messaging first (prevents “Listening” during ring/greeting)
   if (callPhase === "requesting_mic") {
-    setStatus("Requesting microphone…");
+    setStatus("Connecting microphone…");
     return;
   }
   if (callPhase === "ringing") {
-    setStatus("Ringing…");
+    setStatus("Calling Blake…");
+    return;
+  }
+  if (callPhase === "joined") {
+    setStatus("Blake has joined the call…");
     return;
   }
   if (callPhase === "greeting") {
-    // If AI audio is actually playing, show that explicitly
-    if (isPlayingAI && !speakerMuted) setStatus("AI greeting…");
-    else setStatus("Connecting…");
+    if (isPlayingAI && !speakerMuted) setStatus("Blake speaking…");
+    else setStatus("Blake is with you…");
     return;
   }
 
   if (isPlayingAI && !speakerMuted) {
-    setStatus("AI replying…");
+    setStatus("Blake speaking…");
     return;
   }
 
@@ -457,10 +465,7 @@ async function unlockAudioSystem() {
       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     a.volume = 0;
 
-    // Don’t let a rejected play() break the chain
     try {
-      // Important: call play() here; awaiting is okay, but gesture might be fragile.
-      // Even if it rejects, we still proceed.
       await a.play().catch(() => {});
       a.pause();
       a.currentTime = 0;
@@ -478,11 +483,10 @@ function primeIOSGesture() {
   try {
     ensureSharedAudio();
 
-    // Kick off unlock attempt (don’t await; just start it inside gesture)
-    // If it fails, later awaits will retry.
+    // Kick off unlock attempt inside gesture (don't await)
     unlockAudioSystem().catch(() => {});
 
-    // Start mic permission request inside gesture, but don't block the handler
+    // Start mic permission request inside gesture (don't await)
     if (!micPromise && !globalStream) {
       micPromise = navigator.mediaDevices
         .getUserMedia({
@@ -505,7 +509,7 @@ function primeIOSGesture() {
         });
     }
 
-    // Prime VAD AudioContext creation (resume later if needed)
+    // Prime VAD AudioContext creation
     if (!vadAC) {
       vadAC = new (window.AudioContext || window.webkitAudioContext)();
       if (vadAC.state === "suspended") {
@@ -567,7 +571,6 @@ async function playRingTwiceOnConnect() {
 }
 
 function stopRing() {
-  // Shared audio = just pause/reset
   try {
     if (!ttsPlayer) return;
     ttsPlayer.pause();
@@ -616,9 +619,9 @@ async function ensureMicStream() {
       } catch {}
       return globalStream;
     })
-    .finally(() => {
-      // keep micPromise for future awaits if globalStream is set
-      // if it failed, catch above will reset it
+    .catch((e) => {
+      micPromise = null;
+      throw e;
     });
 
   return micPromise;
@@ -626,7 +629,6 @@ async function ensureMicStream() {
 
 /* ---------- VAD setup ---------- */
 async function setupVAD() {
-  // We may have created vadAC during primeIOSGesture()
   if (!vadAC) {
     vadAC = new (window.AudioContext || window.webkitAudioContext)();
   }
@@ -686,7 +688,6 @@ function maybeUpdateNoiseFloor(energy, now) {
   if (now - lastNoiseUpdate < NOISE_FLOOR_UPDATE_MS) return;
   lastNoiseUpdate = now;
 
-  // only learn noise floor when NOT speaking
   const capped = Math.min(energy, noiseFloor * 2.0 + 0.01);
   const alpha = 0.09;
 
@@ -876,7 +877,7 @@ async function drainTTSQueue() {
       aiSpeechStart = performance.now();
       renderStatus();
 
-      // While AI is speaking, stop recording and ignore VAD starts (prevents echo->double replies)
+      // While Blake is speaking, stop recording (prevents echo->double replies)
       if (isRecording) await stopRecordingTurn({ discard: true });
 
       const ok = await playDataUrlTTS(item.base64, item.mime);
@@ -886,10 +887,8 @@ async function drainTTSQueue() {
 
       if (!ok) {
         setTransientStatus("Audio blocked. Tap Call again.", 1800);
-        renderStatus();
-      } else {
-        renderStatus();
       }
+      renderStatus();
     }
   } finally {
     ttsDraining = false;
@@ -1052,8 +1051,7 @@ async function playGreetingOnce() {
     if (b64) {
       await enqueueTTS(b64, mime);
 
-      // Ensure status reads like a greeting, not “Listening…”
-      // callPhase already set to "greeting" by startCall()
+      // While greeting is playing, make sure status stays premium
       if (!speakerMuted) {
         isPlayingAI = true;
         aiSpeechStart = performance.now();
@@ -1198,7 +1196,7 @@ async function startVADLoop() {
     const startThr = thr * VAD_START_MULT;
     const contThr = thr * VAD_CONT_MULT;
 
-    // If AI is speaking and speaker is ON, do NOT start recording from echo.
+    // If Blake is speaking and speaker is ON, do NOT start recording from echo.
     const allowVADStart = !(isPlayingAI && !speakerMuted);
 
     const isVoiceStart = !micMuted && energy > startThr;
@@ -1297,9 +1295,8 @@ async function startVADLoop() {
       setDebugText(
         `state=${vadState}  calling=${isCalling}  rec=${isRecording}\n` +
           `phase=${callPhase}  AI=${isPlayingAI}  micMuted=${micMuted}  spkMuted=${speakerMuted}\n` +
-          `energy=${energy.toFixed(4)}  noise=${noiseFloor.toFixed(
-            4
-          )}  thr=${thr.toFixed(4)}\n` +
+          `energy=${energy.toFixed(4)}  noise=${noiseFloor
+            .toFixed(4)}  thr=${thr.toFixed(4)}\n` +
           `turnQ=${pendingUserTurns.length}  ttsQ=${ttsQueue.length}  epoch=${playbackEpoch}`
       );
     }
@@ -1496,6 +1493,11 @@ async function startCall() {
     renderStatus();
     await playRingTwiceOnConnect();
 
+    // ✅ PREMIUM: tiny “joined” moment before greeting
+    callPhase = "joined";
+    renderStatus();
+    await sleep(PRESENCE_JOIN_MS);
+
     // 3) Bring up VAD + visuals
     await setupVAD();
     setupRingCanvas();
@@ -1506,8 +1508,12 @@ async function startCall() {
     renderStatus();
     await playGreetingOnce();
 
-    // Ensure greeting drained before listening
+    // Ensure greeting drained before moving on
     if (!speakerMuted) await drainTTSQueue();
+
+    // ✅ PREMIUM: warm handoff before Listening
+    setTransientStatus("Blake is here. Go ahead…", PRESENCE_HANDOFF_MS);
+    await sleep(Math.min(420, PRESENCE_HANDOFF_MS)); // don’t over-delay; just enough to feel intentional
 
     // 5) Live
     callPhase = "live";
@@ -1616,5 +1622,5 @@ function endCall() {
 ensureSharedAudio();
 renderStatus();
 log(
-  "✅ call.js loaded: iOS gesture priming (mic+audio+contexts) + single MediaElementSource + PREMIUM status phases (Requesting mic / Ringing / Greeting / Listening) + iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
+  "✅ call.js loaded: iOS gesture priming (mic+audio+contexts) + single MediaElementSource + PREMIUM presence phases (Connecting mic / Calling Blake / Blake joined / Blake speaking / Listening) + iOS-safe RING x2 (shared audio) + VOICE-HOLD VAD start + TINY-BLOB GUARD + LESS SENSITIVE VAD + TRANSCRIPT AUTOSCROLL FIX + OVERLAY REMOVED + MIME-CORRECT TRANSCRIBE + QUEUED TTS WHILE MUTED + DEBUG HUD (D)"
 );
