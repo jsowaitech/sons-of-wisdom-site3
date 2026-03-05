@@ -7,7 +7,7 @@
 // Returns: { text, fileName, mime, pages, chars }
 
 import Busboy from "busboy";
-import extractTextFromBuffer from "./extract-text.js";
+import extractTextFromBuffer from "./lib/extract-text.js";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
