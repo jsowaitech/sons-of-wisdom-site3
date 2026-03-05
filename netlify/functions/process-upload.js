@@ -21,7 +21,7 @@
 
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
-import extractTextFromBuffer from "./lib/extract-text.js";
+import extractTextFromBuffer from "./extract-text.js";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
