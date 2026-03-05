@@ -5,7 +5,9 @@
 // ✅ Audio playback in Home chat, iOS Safari-safe
 // ✅ "Voice replies" toggle defaults OFF
 // ✅ Speak button records -> transcribes (multipart) -> shows interim bubble -> replaces with transcript -> sends to AI -> AI replies with text + voice
-// ✅ Files button: pick file -> upload -> extract text -> auto-send to AI for summary/analysis
+// ✅ Files button: pick PDF/TXT -> upload to Supabase -> extract quick preview -> auto-send summary request
+// ✅ NEW (Option C kickoff): after upload, trigger process-upload to chunk + embed into Supabase for later retrieval
+//    (PDF + TXT only) so coach can reference file naturally in follow-up responses (once call-coach is updated to query it)
 
 sessionStorage.removeItem("sow_redirected");
 
@@ -22,6 +24,9 @@ const TRANSCRIBE_URL = "/.netlify/functions/openai-transcribe";
 // ✅ Upload + Extract endpoints
 const UPLOAD_URL = "/.netlify/functions/upload-file";
 const EXTRACT_URL = "/.netlify/functions/file-extract";
+
+// ✅ Option C: server-side processing (download from storage -> extract -> chunk -> embed -> store)
+const PROCESS_UPLOAD_URL = "/.netlify/functions/process-upload";
 
 // DEV toggle: call OpenAI directly from the browser (no server).
 // ⚠️ For development ONLY — never enable this on production.
@@ -582,7 +587,9 @@ function ensureFilePicker() {
 
   const input = document.createElement("input");
   input.type = "file";
-  input.accept = ".pdf,.txt,.md,.csv,.json,.log,.yaml,.yml,text/*,application/pdf";
+
+  // ✅ Option C scope: PDF + TXT only
+  input.accept = ".pdf,.txt,application/pdf,text/plain";
   input.style.display = "none";
   document.body.appendChild(input);
 
@@ -604,6 +611,14 @@ function pickFileOnce() {
   });
 }
 
+function isAllowedFile(file) {
+  const name = String(file?.name || "").toLowerCase();
+  const type = String(file?.type || "").toLowerCase();
+  const pdf = type.includes("pdf") || name.endsWith(".pdf");
+  const txt = type.startsWith("text/") || name.endsWith(".txt");
+  return pdf || txt;
+}
+
 async function uploadFileToStorage(file) {
   const fd = new FormData();
   fd.append("file", file);
@@ -622,7 +637,9 @@ async function uploadFileToStorage(file) {
   return await res.json().catch(() => ({}));
 }
 
-async function extractFileText(file) {
+async function extractFileTextQuickPreview(file) {
+  // This reads the file directly (multipart) for immediate summary UX.
+  // The long-term memory comes from process-upload (download from storage).
   const fd = new FormData();
   fd.append("file", file);
 
@@ -632,6 +649,29 @@ async function extractFileText(file) {
     throw new Error(`Extract ${res.status}: ${t || res.statusText}`);
   }
   return await res.json().catch(() => ({})); // { text, fileName, mime, pages, chars }
+}
+
+async function startProcessUploadInBackground({ storage_path, bucket, filename }) {
+  // Fire-and-forget from UI standpoint; we still await a short response so we can show status.
+  // If you want *true* background, remove await and just catch.
+  const res = await fetch(PROCESS_UPLOAD_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      storage_path,
+      bucket: bucket || "uploads",
+      filename,
+      conversation_id: conversationId,
+      user_id: session?.user?.id || session?.user?.email,
+    }),
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Process-upload ${res.status}: ${t || res.statusText}`);
+  }
+
+  return await res.json().catch(() => ({}));
 }
 
 function buildFilePrompt({ fileName, text, pages }) {
@@ -661,8 +701,14 @@ async function handleFilesClick() {
   const file = await pickFileOnce();
   if (!file) return;
 
+  if (!isAllowedFile(file)) {
+    appendBubble("ai", "Only PDF and TXT files are supported right now.");
+    setStatus("Unsupported file type.", true);
+    return;
+  }
+
   // Show a user bubble for the file
-  const userBubble = appendBubble("user", `Uploaded: ${file.name}`);
+  appendBubble("user", `Uploaded: ${file.name}`);
 
   // Show interim AI bubble
   const aiBubble = appendBubble("ai", "Uploading and reading your file…");
@@ -673,12 +719,27 @@ async function handleFilesClick() {
   let audioUrlToRevoke = null;
 
   try {
-    // 1) Upload (so you keep a stored copy in Supabase)
-    await uploadFileToStorage(file);
+    // 1) Upload (stored copy in Supabase Storage)
+    const up = await uploadFileToStorage(file);
 
-    // 2) Extract text (PDF/text)
+    // 2) Kick off Option C processing (chunks + embeddings stored in Supabase)
+    // This enables "attach uploaded file content to conversation memory"
+    // once call-coach.js is updated to query those stored chunks.
+    updateBubbleText(aiBubble, "Saving for follow-up memory…");
+    try {
+      await startProcessUploadInBackground({
+        storage_path: up?.path,
+        bucket: up?.bucket || "uploads",
+        filename: up?.filename || file.name,
+      });
+    } catch (e) {
+      console.warn("[HOME] process-upload failed (non-blocking):", e);
+      // We keep going with immediate summary even if embeddings fail.
+    }
+
+    // 3) Quick extract for immediate summary UX (fast feedback)
     updateBubbleText(aiBubble, "Reading text…");
-    const extracted = await extractFileText(file);
+    const extracted = await extractFileTextQuickPreview(file);
     const text = String(extracted?.text || "").trim();
 
     if (!text) {
@@ -687,7 +748,7 @@ async function handleFilesClick() {
       return;
     }
 
-    // 3) Send to AI automatically for summary/analysis
+    // 4) Send to AI automatically for summary/analysis
     updateBubbleText(aiBubble, "Summarizing…");
 
     const wantAudio = !!voiceRepliesEnabled;
@@ -709,6 +770,8 @@ async function handleFilesClick() {
         file_type: file.type || null,
         extracted_pages: extracted?.pages ?? null,
         extracted_chars: extracted?.chars ?? null,
+        storage_path: up?.path || null,
+        storage_bucket: up?.bucket || "uploads",
         timestamp: new Date().toISOString(),
       },
     });
@@ -902,7 +965,7 @@ function bindUI() {
     window.location.href = url.toString();
   });
 
-  // ✅ FIXED: Files now works (no placeholder)
+  // ✅ Files now works
   refs.filesBtn?.addEventListener("click", handleFilesClick);
 
   refs.speakBtn?.addEventListener("click", async () => {

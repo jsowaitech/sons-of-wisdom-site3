@@ -1,5 +1,5 @@
 // netlify/functions/file-extract.js
-// Son of Wisdom — File Extractor (PDF + text)
+// Son of Wisdom — File Extractor (PDF + TXT only)
 // Node 18+ ESM
 //
 // Accepts: multipart/form-data
@@ -7,7 +7,7 @@
 // Returns: { text, fileName, mime, pages, chars }
 
 import Busboy from "busboy";
-import pdf from "pdf-parse";
+import extractTextFromBuffer from "./lib/extract-text.js";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -32,7 +32,7 @@ export const handler = async (event) => {
     const contentType =
       event.headers["content-type"] || event.headers["Content-Type"] || "";
 
-    if (!contentType.includes("multipart/form-data")) {
+    if (!String(contentType).includes("multipart/form-data")) {
       return {
         statusCode: 400,
         headers: cors,
@@ -83,37 +83,21 @@ export const handler = async (event) => {
       };
     }
 
-    let extractedText = "";
-    let pages = null;
+    const extracted = await extractTextFromBuffer(fileBuffer, filename, mime);
 
-    // PDF
-    if (mime.includes("pdf") || filename.toLowerCase().endsWith(".pdf")) {
-      const data = await pdf(fileBuffer);
-      extractedText = data.text || "";
-      pages = data.numpages || null;
-    }
-    // Text-like
-    else if (
-      mime.startsWith("text/") ||
-      filename.match(/\.(txt|md|csv|json|log|yaml|yml)$/i)
-    ) {
-      extractedText = fileBuffer.toString("utf8");
-    }
-    // Fallback
-    else {
+    if (extracted.kind === "unsupported") {
       return {
         statusCode: 415,
         headers: cors,
         body: JSON.stringify({
-          error: "Unsupported file type",
+          error: "Unsupported file type (PDF + TXT only)",
           mime,
+          fileName: filename,
         }),
       };
     }
 
-    extractedText = extractedText.trim();
-
-    if (!extractedText) {
+    if (!extracted.text) {
       return {
         statusCode: 200,
         headers: cors,
@@ -121,7 +105,7 @@ export const handler = async (event) => {
           text: "",
           fileName: filename,
           mime,
-          pages,
+          pages: extracted.pages,
           chars: 0,
           warning: "No readable text found",
         }),
@@ -132,11 +116,11 @@ export const handler = async (event) => {
       statusCode: 200,
       headers: cors,
       body: JSON.stringify({
-        text: extractedText,
+        text: extracted.text,
         fileName: filename,
         mime,
-        pages,
-        chars: extractedText.length,
+        pages: extracted.pages,
+        chars: extracted.chars,
       }),
     };
   } catch (err) {

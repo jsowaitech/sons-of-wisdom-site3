@@ -12,8 +12,7 @@
 // ✅ Adds strict KB instructions + a rewrite pass to conform output to KB lexicon
 //
 // FIX:
-// ✅ Defines KB_LEXICON_LOCK (your previous version referenced it but never defined it,
-//    causing 500 "KB_LEXICON_LOCK is not defined")
+// ✅ Defines KB_LEXICON_LOCK (your previous version referenced it but never defined it)
 //
 // NEW (AUDIO RELIABILITY PATCH):
 // ✅ audio_expected: tells client we attempted/expected audio
@@ -26,6 +25,11 @@
 //
 // NEW (TTS TEXT CLAMP IMPROVED):
 // ✅ Preserves paragraph breaks (newlines) while still removing markdown symbols
+//
+// ✅ NEW (UPLOAD FILE RAG):
+// ✅ Pulls relevant chunks from conversation_document_chunks for this conversationId
+// ✅ Uses Supabase RPC match_conversation_chunks(p_conversation_id, p_query_embedding, p_match_count)
+// ✅ Injects as "CONVERSATION FILE CONTEXT" so coach can reference uploaded PDFs/TXTs naturally
 
 const { Pinecone } = require("@pinecone-database/pinecone");
 const crypto = require("crypto");
@@ -43,6 +47,10 @@ const PINECONE_NAMESPACE = process.env.PINECONE_NAMESPACE || undefined;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SUPABASE_REST = SUPABASE_URL ? `${SUPABASE_URL}/rest/v1` : null;
+
+// ✅ File-chunk retrieval tuning
+const FILE_CONTEXT_TOPK = Number(process.env.FILE_CONTEXT_TOPK || 6); // 4–8 is a good range
+const FILE_CONTEXT_MAX_CHARS = Number(process.env.FILE_CONTEXT_MAX_CHARS || 2800);
 
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
@@ -408,7 +416,22 @@ When you teach using the five primal roles, you must choose at most two roles th
 
 FIRST TURN BEHAVIOR (VERY IMPORTANT)
 
-On your very first reply in a conversation:
+On your very first reply in a conversation, you must distinguish between a simple greeting and a real situation.
+
+1) If his first message is JUST a short greeting or test, with no real situation described
+   (for example: “Hi”, “Hello”, “Hey Blake”, “Testing”, “Good morning”, or something similarly brief):
+
+- Do NOT jump straight into deep coaching questions.
+- Give a short, warm greeting that:
+  - States who you are and why you’re here.
+  - Feels human and welcoming, not robotic.
+  - Gently invites him to share when he’s ready, without pressuring him to immediately unload a deep issue.
+- Example pattern (do not copy word-for-word every time, but keep the spirit):
+  “Hello, I’m AI Blake. I’m here to listen and help you think through what’s on your heart as a man. Whenever you’re ready, you can share something that’s been going on in your life, marriage, kids, or work.”
+- Do NOT immediately demand “one concrete situation” or ask “what happened” on a pure greeting.
+- Stay under 80–100 words, with no Scripture, no tactics, and no plans. This is a welcome, not a diagnosis.
+
+2) If his first message ALREADY includes a situation, a question, or specific pain:
 
 - Do NOT give a generic greeting like “Hi, how can I help?”, “What’s on your mind?”, “What would you like to explore today?”, or any similar variation.
 - Your FIRST sentence must clearly state who you are and why you’re here. Use this pattern (you may vary a few words, but keep the structure and meaning):
@@ -418,10 +441,10 @@ On your very first reply in a conversation:
 - Your SECOND sentence must directly ask for ONE specific, real situation he is facing right now, not abstract topics or doctrine. Use this pattern (light rewording is okay, but keep these elements):
   “Tell me one concrete situation in your life, marriage, kids, or work right now that feels like a battle. What happened?”
 
-Rules:
+Rules for this case:
 
 - You must mention “one concrete situation” and “what happened” in that second sentence.
-- Do NOT ask open questions like “What challenge are you facing?” or “What do you want to explore?” on the first turn.
+- Do NOT ask open questions like “What challenge are you facing?” or “What do you want to explore?” on the first turn when he has already brought some pain.
 - This first reply must still follow diagnostic mode rules:
   - Stay under 120 words,
   - No Scripture, no tactics, no plans,
@@ -981,6 +1004,55 @@ async function insertConversationMessages(conversation, conversationId, userText
   });
 }
 
+// ✅ NEW: pull relevant uploaded-file chunks for this conversation via RPC
+async function fetchConversationFileContext(conversationId, userMessage) {
+  try {
+    if (!SUPABASE_REST || !SUPABASE_SERVICE_ROLE_KEY) return "";
+    if (!conversationId || !isUuid(conversationId)) return "";
+    const q = String(userMessage || "").trim();
+    if (!q) return "";
+
+    // Embed the user query using the SAME embedding dims as your table (1536)
+    const queryEmbedding = await openaiEmbedding(q);
+
+    // Call your SQL function:
+    // match_conversation_chunks(p_conversation_id uuid, p_query_embedding vector(1536), p_match_count int default 8)
+    const rows = await supaFetch("rpc/match_conversation_chunks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        p_conversation_id: conversationId,
+        p_query_embedding: queryEmbedding,
+        p_match_count: FILE_CONTEXT_TOPK,
+      }),
+    });
+
+    if (!Array.isArray(rows) || !rows.length) return "";
+
+    // rows: [{ id, document_id, chunk_index, content, similarity }, ...]
+    const snippets = rows
+      .filter((r) => r && r.content)
+      .sort((a, b) => (b.similarity || 0) - (a.similarity || 0))
+      .map((r) => String(r.content || "").trim())
+      .filter(Boolean);
+
+    if (!snippets.length) return "";
+
+    // Bound total size so we don’t blow tokens
+    let out = "";
+    for (const s of snippets) {
+      const next = (out ? out + "\n\n---\n\n" : "") + s;
+      if (next.length > FILE_CONTEXT_MAX_CHARS) break;
+      out = next;
+    }
+
+    return out.trim();
+  } catch (e) {
+    console.error("[call-coach] fetchConversationFileContext error:", e);
+    return "";
+  }
+}
+
 // ---------- ElevenLabs TTS (hardened) ----------
 async function elevenLabsTTS(text) {
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
@@ -1132,6 +1204,10 @@ exports.handler = async (event) => {
       const kbContext = await getKnowledgeContext(kbQuery);
       const usedKnowledge = Boolean(kbContext && kbContext.trim());
 
+      // ✅ NEW: Conversation file context (uploaded PDFs/TXTs embedded into pgvector)
+      const fileContext = await fetchConversationFileContext(conversationId, userMessageForAI);
+      const usedFileContext = Boolean(fileContext && fileContext.trim());
+
       const messages = [];
       messages.push({ role: "system", content: SYSTEM_PROMPT_BLAKE });
       messages.push({ role: "system", content: KB_LEXICON_LOCK });
@@ -1163,6 +1239,22 @@ KNOWLEDGE BASE CONTEXT:
 ${kbContext || "EMPTY"}
 `.trim();
       messages.push({ role: "system", content: kbInstruction });
+
+      // ✅ NEW: Inject file context separately (this is the user’s uploaded content)
+      // This should be treated as “case material”, not “Son of Wisdom doctrine”.
+      if (usedFileContext) {
+        const fileInstruction = `
+CONVERSATION FILE CONTEXT (USER UPLOADED)
+The user has uploaded files earlier in this conversation. The following excerpts are from those files.
+Use them as factual context and reference them naturally if relevant.
+Do not claim these excerpts are Son of Wisdom doctrine unless the excerpt itself is Son of Wisdom material.
+Do not read this block back verbatim; weave it into your coaching only when it helps.
+
+FILE EXCERPTS:
+${fileContext}
+`.trim();
+        messages.push({ role: "system", content: fileInstruction });
+      }
 
       const memoryInstruction = `
 Conversation memory context for this thread.
@@ -1198,6 +1290,7 @@ Use this context to stay consistent. Do not read this back to the user.
       let reply = clampTtsSafe(rawReply, 1200);
 
       // 🔒 Enforce KB lexicon with a rewrite pass (only if KB exists)
+      // Note: We do NOT force file excerpts into the KB lexicon. This pass is only for Son of Wisdom phrasing.
       try {
         reply = await rewriteToKbLexicon(reply, kbContext);
       } catch (e) {
@@ -1218,6 +1311,7 @@ Use this context to stay consistent. Do not read this back to the user.
             source,
             input_transcript: userMessageForAI,
             ai_text: reply,
+            used_file_context: usedFileContext ? true : false,
             created_at: nowIso,
           });
         } catch (e) {
@@ -1259,6 +1353,7 @@ Use this context to stay consistent. Do not read this back to the user.
         text: reply,
         assistant_text: reply,
         usedKnowledge,
+        usedFileContext,
         conversationId: conversationId || null,
         call_id: callId || null,
         audio_expected,
