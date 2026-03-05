@@ -5,9 +5,8 @@
 // ✅ Audio playback in Home chat, iOS Safari-safe
 // ✅ "Voice replies" toggle defaults OFF
 // ✅ Speak button records -> transcribes (multipart) -> shows interim bubble -> replaces with transcript -> sends to AI -> AI replies with text + voice
-// ✅ Files button: pick PDF/TXT -> upload to Supabase -> extract quick preview -> auto-send summary request
-// ✅ NEW (Option C kickoff): after upload, trigger process-upload to chunk + embed into Supabase for later retrieval
-//    (PDF + TXT only) so coach can reference file naturally in follow-up responses (once call-coach is updated to query it)
+// ✅ Files button: pick file -> upload -> extract text -> auto-send to AI for summary/analysis
+// ✅ NEW (Option C): After upload, calls process-upload to chunk/embed/store PDF+TXT into Supabase for conversation memory
 
 sessionStorage.removeItem("sow_redirected");
 
@@ -21,11 +20,9 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const CHAT_URL = "/.netlify/functions/call-coach";
 const TRANSCRIBE_URL = "/.netlify/functions/openai-transcribe";
 
-// ✅ Upload + Extract endpoints
+// Upload + Extract + Process (Option C)
 const UPLOAD_URL = "/.netlify/functions/upload-file";
 const EXTRACT_URL = "/.netlify/functions/file-extract";
-
-// ✅ Option C: server-side processing (download from storage -> extract -> chunk -> embed -> store)
 const PROCESS_UPLOAD_URL = "/.netlify/functions/process-upload";
 
 // DEV toggle: call OpenAI directly from the browser (no server).
@@ -279,7 +276,12 @@ async function loadConversationHistory(convId) {
 }
 
 /* ---------------------------- networking ------------------------------ */
-async function coachRequest({ text, source = "chat", wantAudio = false, extra = {} }) {
+async function coachRequest({
+  text,
+  source = "chat",
+  wantAudio = false,
+  extra = {},
+}) {
   if (DEV_DIRECT_OPENAI) {
     const reply = await chatDirectOpenAI(text, extra);
     return { assistant_text: reply, audio_base64: null, mime: null };
@@ -354,11 +356,15 @@ async function chatDirectOpenAI(text, meta = {}) {
 
 /* ---------------------- multipart transcription ---------------------- */
 async function transcribeAudioBlobMultipart(blob, mime) {
-  const ext =
-    mime?.includes("ogg") ? "ogg" :
-    mime?.includes("mp4") ? "m4a" :
-    mime?.includes("mpeg") ? "mp3" :
-    mime?.includes("webm") ? "webm" : "webm";
+  const ext = mime?.includes("ogg")
+    ? "ogg"
+    : mime?.includes("mp4")
+    ? "m4a"
+    : mime?.includes("mpeg")
+    ? "mp3"
+    : mime?.includes("webm")
+    ? "webm"
+    : "webm";
 
   const filename = `audio.${ext}`;
 
@@ -578,7 +584,7 @@ function stopRecording() {
   setStatus("Processing audio…");
 }
 
-/* -------------------------- FILES (upload -> extract -> auto AI) -------------------------- */
+/* -------------------------- FILES (upload -> extract -> process-upload -> auto AI) -------------------------- */
 
 // Lazy-create a hidden file input (no HTML changes)
 let fileInputEl = null;
@@ -588,7 +594,7 @@ function ensureFilePicker() {
   const input = document.createElement("input");
   input.type = "file";
 
-  // ✅ Option C scope: PDF + TXT only
+  // ✅ Supabase/OpenAI embeddings PDF + TXT only (per requirement)
   input.accept = ".pdf,.txt,application/pdf,text/plain";
   input.style.display = "none";
   document.body.appendChild(input);
@@ -614,9 +620,9 @@ function pickFileOnce() {
 function isAllowedFile(file) {
   const name = String(file?.name || "").toLowerCase();
   const type = String(file?.type || "").toLowerCase();
-  const pdf = type.includes("pdf") || name.endsWith(".pdf");
-  const txt = type.startsWith("text/") || name.endsWith(".txt");
-  return pdf || txt;
+  const pdfOk = type.includes("pdf") || name.endsWith(".pdf");
+  const txtOk = type.startsWith("text/") || name.endsWith(".txt");
+  return pdfOk || txtOk;
 }
 
 async function uploadFileToStorage(file) {
@@ -637,9 +643,7 @@ async function uploadFileToStorage(file) {
   return await res.json().catch(() => ({}));
 }
 
-async function extractFileTextQuickPreview(file) {
-  // This reads the file directly (multipart) for immediate summary UX.
-  // The long-term memory comes from process-upload (download from storage).
+async function extractFileText(file) {
   const fd = new FormData();
   fd.append("file", file);
 
@@ -651,24 +655,32 @@ async function extractFileTextQuickPreview(file) {
   return await res.json().catch(() => ({})); // { text, fileName, mime, pages, chars }
 }
 
-async function startProcessUploadInBackground({ storage_path, bucket, filename }) {
-  // Fire-and-forget from UI standpoint; we still await a short response so we can show status.
-  // If you want *true* background, remove await and just catch.
+async function processUploadToMemory(uploadJson, originalFile) {
+  // uploadJson from upload-file.js returns: { bucket, path, filename, content_type, bytes, ... }
+  const payload = {
+    bucket: uploadJson?.bucket || "uploads",
+    storage_path: uploadJson?.path,
+    filename: uploadJson?.filename || originalFile?.name || "upload",
+    content_type: uploadJson?.content_type || originalFile?.type || null,
+    bytes: typeof uploadJson?.bytes === "number" ? uploadJson.bytes : undefined,
+    conversation_id: conversationId,
+    user_id: session?.user?.id || session?.user?.email || null,
+  };
+
+  if (!payload.storage_path) {
+    throw new Error("Missing upload storage path (upload-file did not return path).");
+  }
+
   const res = await fetch(PROCESS_UPLOAD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      storage_path,
-      bucket: bucket || "uploads",
-      filename,
-      conversation_id: conversationId,
-      user_id: session?.user?.id || session?.user?.email,
-    }),
+    body: JSON.stringify(payload),
   });
 
+  // Important: if this fails, we still can summarize from extracted text.
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`Process-upload ${res.status}: ${t || res.statusText}`);
+    throw new Error(`process-upload ${res.status}: ${t || res.statusText}`);
   }
 
   return await res.json().catch(() => ({}));
@@ -678,7 +690,6 @@ function buildFilePrompt({ fileName, text, pages }) {
   const safeName = fileName || "file";
   const pageNote = pages ? ` (${pages} pages)` : "";
 
-  // Keep prompt simple + premium
   return `
 You received an uploaded file: "${safeName}"${pageNote}.
 
@@ -719,27 +730,25 @@ async function handleFilesClick() {
   let audioUrlToRevoke = null;
 
   try {
-    // 1) Upload (stored copy in Supabase Storage)
-    const up = await uploadFileToStorage(file);
+    // 1) Upload (keep stored copy in Supabase)
+    updateBubbleText(aiBubble, "Uploading…");
+    const uploadJson = await uploadFileToStorage(file);
 
-    // 2) Kick off Option C processing (chunks + embeddings stored in Supabase)
-    // This enables "attach uploaded file content to conversation memory"
-    // once call-coach.js is updated to query those stored chunks.
-    updateBubbleText(aiBubble, "Saving for follow-up memory…");
+    // 2) Kick off Option C (embed/store) — do not block summary if it fails
+    let processResult = null;
     try {
-      await startProcessUploadInBackground({
-        storage_path: up?.path,
-        bucket: up?.bucket || "uploads",
-        filename: up?.filename || file.name,
-      });
+      updateBubbleText(aiBubble, "Saving to conversation memory…");
+      processResult = await processUploadToMemory(uploadJson, file);
+      // processResult: { ok, document_id, chunks_created, ... } (if successful)
+      console.log("[HOME] process-upload result:", processResult);
     } catch (e) {
-      console.warn("[HOME] process-upload failed (non-blocking):", e);
-      // We keep going with immediate summary even if embeddings fail.
+      console.warn("[HOME] process-upload failed (continuing):", e);
+      // Continue anyway
     }
 
-    // 3) Quick extract for immediate summary UX (fast feedback)
+    // 3) Extract text locally via function (PDF/text)
     updateBubbleText(aiBubble, "Reading text…");
-    const extracted = await extractFileTextQuickPreview(file);
+    const extracted = await extractFileText(file);
     const text = String(extracted?.text || "").trim();
 
     if (!text) {
@@ -770,8 +779,11 @@ async function handleFilesClick() {
         file_type: file.type || null,
         extracted_pages: extracted?.pages ?? null,
         extracted_chars: extracted?.chars ?? null,
-        storage_path: up?.path || null,
-        storage_bucket: up?.bucket || "uploads",
+        // Option C metadata (helps debug / future filtering)
+        uploaded_bucket: uploadJson?.bucket ?? null,
+        uploaded_path: uploadJson?.path ?? null,
+        processed_document_id: processResult?.document_id ?? null,
+        processed_chunks: processResult?.chunks_created ?? null,
         timestamp: new Date().toISOString(),
       },
     });
@@ -841,8 +853,10 @@ function initTooltips() {
   document.body.appendChild(tt);
 
   const setContent = (el) => {
-    tt.querySelector(".tt-title").textContent = el.getAttribute("data-tt-title") || "";
-    tt.querySelector(".tt-body").textContent = el.getAttribute("data-tt-body") || "";
+    tt.querySelector(".tt-title").textContent =
+      el.getAttribute("data-tt-title") || "";
+    tt.querySelector(".tt-body").textContent =
+      el.getAttribute("data-tt-body") || "";
   };
 
   const position = (el) => {
@@ -965,7 +979,7 @@ function bindUI() {
     window.location.href = url.toString();
   });
 
-  // ✅ Files now works
+  // ✅ Files flow wired
   refs.filesBtn?.addEventListener("click", handleFilesClick);
 
   refs.speakBtn?.addEventListener("click", async () => {
