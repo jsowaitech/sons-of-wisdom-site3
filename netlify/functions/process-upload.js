@@ -1,10 +1,10 @@
 // netlify/functions/process-upload.js
-// Son of Wisdom — Process Uploaded File -> Extract text -> Chunk -> Embed -> Store in Supabase
+// Process Uploaded File -> Extract text -> Chunk -> Embed -> Store in Supabase
 // Node 18+ ESM (Netlify Functions)
 //
 // Accepts: application/json POST
 // {
-//   storage_path: "uploads/<user>/<conv>/<date>/<uuid>_<filename>",
+//   storage_path: "uploads/<...>/<filename>",
 //   filename: "my.pdf",
 //   content_type?: "application/pdf" | "text/plain" | ...,
 //   bytes?: number,
@@ -13,22 +13,15 @@
 //   bucket?: "uploads" (default)
 // }
 //
-// Supports: PDF + TXT only (per your requirement)
+// Supports: PDF + TXT only
 //
 // Writes:
 // - conversation_documents (one row per uploaded doc)
-// - conversation_document_chunks (many rows w/ embeddings)
-//
-// ENV required:
-// - SUPABASE_URL
-// - SUPABASE_SERVICE_ROLE_KEY
-// - OPENAI_API_KEY
-// Optional:
-// - OPENAI_EMBED_MODEL (default text-embedding-3-small)
+// - conversation_document_chunks (many rows with embeddings)
 
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
-import pdf from "pdf-parse";
+import extractTextFromBuffer from "./lib/extract-text.js";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -45,7 +38,8 @@ const noStoreHeaders = {
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_EMBED_MODEL = process.env.OPENAI_EMBED_MODEL || "text-embedding-3-small";
+const OPENAI_EMBED_MODEL =
+  process.env.OPENAI_EMBED_MODEL || "text-embedding-3-small";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
@@ -82,88 +76,35 @@ function normalizeWhitespace(s) {
     .trim();
 }
 
-/**
- * Chunking (simple + stable):
- * - Aim ~900 tokens/chunk, overlap ~120 tokens
- * Uses tiktoken if available, otherwise falls back to word-based.
- */
-async function chunkTextTokenAware(text, { targetTokens = 900, overlapTokens = 120 } = {}) {
+// Simple chunking (stable, no dependencies)
+function chunkText(text, { wordsPerChunk = 650, overlapWords = 90 } = {}) {
   const clean = normalizeWhitespace(text);
-  if (!clean) return { chunks: [], tokenCounts: [] };
+  if (!clean) return [];
 
-  let enc = null;
-  try {
-    // tiktoken is ESM; in some Netlify bundles it may fail. We gracefully fallback.
-    const mod = await import("tiktoken");
-    const { get_encoding } = mod;
-    enc = get_encoding("cl100k_base");
-  } catch {
-    enc = null;
-  }
+  const words = clean.split(/\s+/).filter(Boolean);
+  if (!words.length) return [];
 
-  if (!enc) {
-    // Fallback: word chunks (roughly)
-    const words = clean.split(/\s+/).filter(Boolean);
-    const approxWordsPerChunk = 650; // ~900 tokens-ish for normal English
-    const approxOverlap = 90;
-
-    const chunks = [];
-    const tokenCounts = [];
-    for (let i = 0; i < words.length; i += Math.max(1, approxWordsPerChunk - approxOverlap)) {
-      const slice = words.slice(i, i + approxWordsPerChunk).join(" ");
-      if (slice.trim()) {
-        chunks.push(slice);
-        tokenCounts.push(slice.split(/\s+/).length);
-      }
-    }
-    return { chunks, tokenCounts };
-  }
-
-  const tokens = enc.encode(clean);
+  const step = Math.max(1, wordsPerChunk - overlapWords);
   const chunks = [];
-  const tokenCounts = [];
 
-  let i = 0;
-  while (i < tokens.length) {
-    const end = Math.min(tokens.length, i + targetTokens);
-    const windowTokens = tokens.slice(i, end);
-    const chunk = enc.decode(windowTokens);
-    const trimmed = chunk.trim();
-    if (trimmed) {
-      chunks.push(trimmed);
-      tokenCounts.push(windowTokens.length);
-    }
-    if (end >= tokens.length) break;
-    i = Math.max(0, end - overlapTokens);
+  for (let i = 0; i < words.length; i += step) {
+    const slice = words.slice(i, i + wordsPerChunk).join(" ");
+    const asString = String(slice || "").trim();
+    if (asString) chunks.push(asString);
   }
 
-  try {
-    enc.free?.();
-  } catch {}
-
-  return { chunks, tokenCounts };
-}
-
-async function extractTextFromBuffer(buffer, filename, mime) {
-  if (isPdf(filename, mime)) {
-    const data = await pdf(buffer);
-    const t = data?.text || "";
-    return { text: normalizeWhitespace(t), pages: data?.numpages || null };
-  }
-
-  if (isTxt(filename, mime)) {
-    const t = buffer.toString("utf8");
-    return { text: normalizeWhitespace(t), pages: null };
-  }
-
-  return { text: "", pages: null };
+  return chunks;
 }
 
 async function createEmbedding(input) {
+  const text = String(input || "").slice(0, 8000);
+  if (!text.trim()) return null;
+
   const res = await openai.embeddings.create({
     model: OPENAI_EMBED_MODEL,
-    input: String(input || "").slice(0, 8000),
+    input: text,
   });
+
   return res?.data?.[0]?.embedding || null;
 }
 
@@ -175,7 +116,11 @@ async function insertChunksBatch(rows) {
 
 export const handler = async (event) => {
   if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers: { ...corsHeaders, "Cache-Control": "no-store" }, body: "" };
+    return {
+      statusCode: 204,
+      headers: { ...corsHeaders, "Cache-Control": "no-store" },
+      body: "",
+    };
   }
 
   if (event.httpMethod !== "POST") {
@@ -233,7 +178,7 @@ export const handler = async (event) => {
       };
     }
 
-    // PDF + TXT only
+    // Only PDF + TXT
     const allowPdf = isPdf(filename, content_type);
     const allowTxt = isTxt(filename, content_type);
 
@@ -249,7 +194,7 @@ export const handler = async (event) => {
       };
     }
 
-    // Download from Supabase Storage
+    // 1) Download from Supabase Storage
     const { data: fileData, error: downloadError } = await supabase.storage
       .from(bucket)
       .download(storage_path);
@@ -269,8 +214,23 @@ export const handler = async (event) => {
 
     const buffer = Buffer.from(await fileData.arrayBuffer());
 
-    // Extract
-    const { text, pages } = await extractTextFromBuffer(buffer, filename, content_type);
+    // 2) Extract text using your shared lib (prevents DOMMatrix errors)
+    const extracted = await extractTextFromBuffer(buffer, filename, content_type);
+
+    if (extracted.kind === "unsupported") {
+      return {
+        statusCode: 415,
+        headers: noStoreHeaders,
+        body: JSON.stringify({
+          error: "Unsupported file type (PDF + TXT only)",
+          filename,
+          content_type,
+        }),
+      };
+    }
+
+    const text = normalizeWhitespace(extracted.text || "");
+    const pages = extracted.pages || null;
 
     if (!text || text.length < 20) {
       return {
@@ -280,12 +240,12 @@ export const handler = async (event) => {
           ok: true,
           message: "File had no usable text",
           chars: (text || "").length,
-          pages: pages || null,
+          pages,
         }),
       };
     }
 
-    // Create conversation_documents row
+    // 3) Create conversation_documents row
     const { data: doc, error: docErr } = await supabase
       .from("conversation_documents")
       .insert({
@@ -304,22 +264,19 @@ export const handler = async (event) => {
       throw docErr || new Error("Failed to create conversation_documents row");
     }
 
-    // Chunk
-    const { chunks, tokenCounts } = await chunkTextTokenAware(text, {
-      targetTokens: 900,
-      overlapTokens: 120,
-    });
+    // 4) Chunk
+    const chunks = chunkText(text, { wordsPerChunk: 650, overlapWords: 90 });
 
-    // Embed + insert chunks
+    // 5) Embed + insert chunks (batched)
     const BATCH_SIZE = 20;
     let batch = [];
     let created = 0;
 
     for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const token_count = tokenCounts?.[i] ?? null;
+      // ✅ Force string + safe trim so "chunk.trim is not a function" never happens
+      const chunk = String(chunks[i] || "").trim();
+      if (!chunk) continue;
 
-      // Create embedding
       const embedding = await createEmbedding(chunk);
       if (!embedding) continue;
 
@@ -328,7 +285,7 @@ export const handler = async (event) => {
         document_id: doc.id,
         chunk_index: i,
         content: chunk,
-        token_count,
+        token_count: null,
         embedding,
       });
 
@@ -352,7 +309,7 @@ export const handler = async (event) => {
         document_id: doc.id,
         chunks_created: created,
         chunks_total: chunks.length,
-        pages: pages || null,
+        pages,
         chars: text.length,
         bucket,
         storage_path,
