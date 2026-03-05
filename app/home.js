@@ -5,8 +5,7 @@
 // ✅ Audio playback in Home chat, iOS Safari-safe
 // ✅ "Voice replies" toggle defaults OFF
 // ✅ Speak button records -> transcribes (multipart) -> shows interim bubble -> replaces with transcript -> sends to AI -> AI replies with text + voice
-// ✅ Files button: pick file -> upload -> extract text -> auto-send to AI for summary/analysis
-// ✅ NEW (Option C): After upload, calls process-upload to chunk/embed/store PDF+TXT into Supabase for conversation memory
+// ✅ Files button: pick file -> upload to Supabase Storage -> index via process-upload (extract/chunk/embed) -> then auto-ask AI for summary
 
 sessionStorage.removeItem("sow_redirected");
 
@@ -20,9 +19,8 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const CHAT_URL = "/.netlify/functions/call-coach";
 const TRANSCRIBE_URL = "/.netlify/functions/openai-transcribe";
 
-// Upload + Extract + Process (Option C)
+// ✅ Upload + index endpoints
 const UPLOAD_URL = "/.netlify/functions/upload-file";
-const EXTRACT_URL = "/.netlify/functions/file-extract";
 const PROCESS_UPLOAD_URL = "/.netlify/functions/process-upload";
 
 // DEV toggle: call OpenAI directly from the browser (no server).
@@ -276,12 +274,7 @@ async function loadConversationHistory(convId) {
 }
 
 /* ---------------------------- networking ------------------------------ */
-async function coachRequest({
-  text,
-  source = "chat",
-  wantAudio = false,
-  extra = {},
-}) {
+async function coachRequest({ text, source = "chat", wantAudio = false, extra = {} }) {
   if (DEV_DIRECT_OPENAI) {
     const reply = await chatDirectOpenAI(text, extra);
     return { assistant_text: reply, audio_base64: null, mime: null };
@@ -356,15 +349,11 @@ async function chatDirectOpenAI(text, meta = {}) {
 
 /* ---------------------- multipart transcription ---------------------- */
 async function transcribeAudioBlobMultipart(blob, mime) {
-  const ext = mime?.includes("ogg")
-    ? "ogg"
-    : mime?.includes("mp4")
-    ? "m4a"
-    : mime?.includes("mpeg")
-    ? "mp3"
-    : mime?.includes("webm")
-    ? "webm"
-    : "webm";
+  const ext =
+    mime?.includes("ogg") ? "ogg" :
+    mime?.includes("mp4") ? "m4a" :
+    mime?.includes("mpeg") ? "mp3" :
+    mime?.includes("webm") ? "webm" : "webm";
 
   const filename = `audio.${ext}`;
 
@@ -584,7 +573,7 @@ function stopRecording() {
   setStatus("Processing audio…");
 }
 
-/* -------------------------- FILES (upload -> extract -> process-upload -> auto AI) -------------------------- */
+/* -------------------------- FILES (upload -> process-upload -> auto AI) -------------------------- */
 
 // Lazy-create a hidden file input (no HTML changes)
 let fileInputEl = null;
@@ -593,9 +582,7 @@ function ensureFilePicker() {
 
   const input = document.createElement("input");
   input.type = "file";
-
-  // ✅ Supabase/OpenAI embeddings PDF + TXT only (per requirement)
-  input.accept = ".pdf,.txt,application/pdf,text/plain";
+  input.accept = ".pdf,.txt,text/plain,application/pdf";
   input.style.display = "none";
   document.body.appendChild(input);
 
@@ -617,14 +604,6 @@ function pickFileOnce() {
   });
 }
 
-function isAllowedFile(file) {
-  const name = String(file?.name || "").toLowerCase();
-  const type = String(file?.type || "").toLowerCase();
-  const pdfOk = type.includes("pdf") || name.endsWith(".pdf");
-  const txtOk = type.startsWith("text/") || name.endsWith(".txt");
-  return pdfOk || txtOk;
-}
-
 async function uploadFileToStorage(file) {
   const fd = new FormData();
   fd.append("file", file);
@@ -643,64 +622,27 @@ async function uploadFileToStorage(file) {
   return await res.json().catch(() => ({}));
 }
 
-async function extractFileText(file) {
-  const fd = new FormData();
-  fd.append("file", file);
-
-  const res = await fetch(EXTRACT_URL, { method: "POST", body: fd });
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`Extract ${res.status}: ${t || res.statusText}`);
-  }
-  return await res.json().catch(() => ({})); // { text, fileName, mime, pages, chars }
-}
-
-async function processUploadToMemory(uploadJson, originalFile) {
-  // uploadJson from upload-file.js returns: { bucket, path, filename, content_type, bytes, ... }
-  const payload = {
-    bucket: uploadJson?.bucket || "uploads",
-    storage_path: uploadJson?.path,
-    filename: uploadJson?.filename || originalFile?.name || "upload",
-    content_type: uploadJson?.content_type || originalFile?.type || null,
-    bytes: typeof uploadJson?.bytes === "number" ? uploadJson.bytes : undefined,
-    conversation_id: conversationId,
-    user_id: session?.user?.id || session?.user?.email || null,
-  };
-
-  if (!payload.storage_path) {
-    throw new Error("Missing upload storage path (upload-file did not return path).");
-  }
-
+async function processUploadIndex(payload) {
   const res = await fetch(PROCESS_UPLOAD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
-  // Important: if this fails, we still can summarize from extracted text.
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`process-upload ${res.status}: ${t || res.statusText}`);
+    throw new Error(`Process-upload ${res.status}: ${t || res.statusText}`);
   }
 
   return await res.json().catch(() => ({}));
 }
 
-function buildFilePrompt({ fileName, text, pages }) {
-  const safeName = fileName || "file";
-  const pageNote = pages ? ` (${pages} pages)` : "";
-
+function buildPostUploadPrompt(fileName) {
+  const safeName = fileName || "the file";
   return `
-You received an uploaded file: "${safeName}"${pageNote}.
-
-Do these:
-1) Give a concise summary (5-10 bullets).
-2) Pull out key takeaways and action items.
-3) If it's a contract/policy/plan, list risks + missing info.
-4) End with 3 questions to ask the user next.
-
-File text:
-${text}
+I uploaded a file named "${safeName}" to this conversation.
+Use it as context for this thread.
+Give me a concise summary and the key takeaways, then tell me what I should do next based on it.
 `.trim();
 }
 
@@ -712,17 +654,11 @@ async function handleFilesClick() {
   const file = await pickFileOnce();
   if (!file) return;
 
-  if (!isAllowedFile(file)) {
-    appendBubble("ai", "Only PDF and TXT files are supported right now.");
-    setStatus("Unsupported file type.", true);
-    return;
-  }
-
   // Show a user bubble for the file
   appendBubble("user", `Uploaded: ${file.name}`);
 
   // Show interim AI bubble
-  const aiBubble = appendBubble("ai", "Uploading and reading your file…");
+  const aiBubble = appendBubble("ai", "Uploading your file…");
 
   setSendingState(true);
   setStatus("Processing file…");
@@ -730,45 +666,71 @@ async function handleFilesClick() {
   let audioUrlToRevoke = null;
 
   try {
-    // 1) Upload (keep stored copy in Supabase)
-    updateBubbleText(aiBubble, "Uploading…");
-    const uploadJson = await uploadFileToStorage(file);
+    // 1) Upload to Supabase Storage (via Netlify function)
+    const up = await uploadFileToStorage(file);
 
-    // 2) Kick off Option C (embed/store) — do not block summary if it fails
-    let processResult = null;
-    try {
-      updateBubbleText(aiBubble, "Saving to conversation memory…");
-      processResult = await processUploadToMemory(uploadJson, file);
-      // processResult: { ok, document_id, chunks_created, ... } (if successful)
-      console.log("[HOME] process-upload result:", processResult);
-    } catch (e) {
-      console.warn("[HOME] process-upload failed (continuing):", e);
-      // Continue anyway
-    }
+    // Try to read the important fields from upload-file response (support multiple shapes)
+    const bucket =
+      up.bucket || up.storage_bucket || up.storageBucket || "uploads";
 
-    // 3) Extract text locally via function (PDF/text)
-    updateBubbleText(aiBubble, "Reading text…");
-    const extracted = await extractFileText(file);
-    const text = String(extracted?.text || "").trim();
+    const storage_path =
+      up.storage_path ||
+      up.path ||
+      up.storagePath ||
+      up.key ||
+      up.fullPath ||
+      "";
 
-    if (!text) {
-      updateBubbleText(aiBubble, "I couldn’t find readable text in that file.");
-      setStatus("No readable text found.", true);
+    const filename =
+      up.filename || up.fileName || file.name;
+
+    const content_type =
+      up.content_type || up.mime || up.mimetype || file.type || "";
+
+    const bytes =
+      typeof up.bytes === "number" ? up.bytes : file.size;
+
+    if (!storage_path) {
+      // If upload-file didn’t return a path, we can’t index.
+      updateBubbleText(aiBubble, "Upload finished, but I didn’t get a storage path to index. Check upload-file.js response.");
+      setStatus("Upload response missing storage_path.", true);
       return;
     }
 
-    // 4) Send to AI automatically for summary/analysis
-    updateBubbleText(aiBubble, "Summarizing…");
+    // 2) Index (extract -> chunk -> embed -> store in Supabase tables)
+    updateBubbleText(aiBubble, "Indexing (reading + chunking)…");
 
-    const wantAudio = !!voiceRepliesEnabled;
-    const prompt = buildFilePrompt({
-      fileName: extracted?.fileName || file.name,
-      text,
-      pages: extracted?.pages || null,
+    const indexRes = await processUploadIndex({
+      bucket,
+      storage_path,
+      filename,
+      content_type,
+      bytes,
+      conversation_id: conversationId,
+      user_id: session?.user?.id || session?.user?.email || null,
     });
 
+    if (!indexRes?.ok && !indexRes?.success) {
+      // process-upload sometimes returns { ok:true } or { success:true }
+      updateBubbleText(
+        aiBubble,
+        `Upload worked, but indexing did not finish. ${indexRes?.error || indexRes?.message || ""}`.trim()
+      );
+      setStatus("Indexing did not finish.", true);
+      return;
+    }
+
+    updateBubbleText(
+      aiBubble,
+      `File indexed. Chunks created: ${indexRes?.chunks_created ?? indexRes?.chunksCreated ?? "?"}.`
+    );
+
+    // 3) Auto-ask the AI to summarize USING the uploaded document context
+    setStatus("Summarizing…");
+
+    const wantAudio = !!voiceRepliesEnabled;
     const { assistant_text, audio_base64, mime } = await coachRequest({
-      text: prompt,
+      text: buildPostUploadPrompt(file.name),
       source: wantAudio ? "voice" : "chat",
       wantAudio,
       extra: {
@@ -777,18 +739,13 @@ async function handleFilesClick() {
         input_mode: "files",
         file_name: file.name,
         file_type: file.type || null,
-        extracted_pages: extracted?.pages ?? null,
-        extracted_chars: extracted?.chars ?? null,
-        // Option C metadata (helps debug / future filtering)
-        uploaded_bucket: uploadJson?.bucket ?? null,
-        uploaded_path: uploadJson?.path ?? null,
-        processed_document_id: processResult?.document_id ?? null,
-        processed_chunks: processResult?.chunks_created ?? null,
+        storage_bucket: bucket,
+        storage_path,
         timestamp: new Date().toISOString(),
       },
     });
 
-    // Replace interim bubble with the actual summary
+    // Replace interim bubble with the actual summary reply
     updateBubbleText(aiBubble, assistant_text || "…");
 
     // Optional voice
@@ -796,7 +753,6 @@ async function handleFilesClick() {
       const { url } = base64ToBlobUrl(audio_base64, mime || "audio/mpeg");
       audioUrlToRevoke = url;
 
-      // add a play button row
       const audioRow = document.createElement("div");
       audioRow.className = "bubble-audio-row";
 
@@ -853,10 +809,8 @@ function initTooltips() {
   document.body.appendChild(tt);
 
   const setContent = (el) => {
-    tt.querySelector(".tt-title").textContent =
-      el.getAttribute("data-tt-title") || "";
-    tt.querySelector(".tt-body").textContent =
-      el.getAttribute("data-tt-body") || "";
+    tt.querySelector(".tt-title").textContent = el.getAttribute("data-tt-title") || "";
+    tt.querySelector(".tt-body").textContent = el.getAttribute("data-tt-body") || "";
   };
 
   const position = (el) => {
@@ -979,7 +933,7 @@ function bindUI() {
     window.location.href = url.toString();
   });
 
-  // ✅ Files flow wired
+  // ✅ Files: upload -> process-upload -> auto summarize
   refs.filesBtn?.addEventListener("click", handleFilesClick);
 
   refs.speakBtn?.addEventListener("click", async () => {

@@ -13,7 +13,7 @@
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
     "openai": "^6.26.0",
-    "pdf-parse": "^2.4.5",
+    "pdf-parse": "^1.1.1",
     "tiktoken": "^1.0.22"
   }
 }
